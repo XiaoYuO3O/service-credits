@@ -1,0 +1,6 @@
+{
+  "name": "Service credits｜系學會服務學習點數評核系統",
+  "description": "採用 Sattolo 單環置換演算法、雙盲零知識不可追溯架構與 ECHO 語氣去風格化防禦機制的現代化系學會服務學習點數評核系統。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
