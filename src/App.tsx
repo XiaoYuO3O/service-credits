@@ -1,21 +1,24 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   AnonymousEvaluationRecord,
   EventSession,
   RubricItem,
   SystemState,
 } from './types';
-import { createInitialSystemState } from './utils/demoData';
-import { decodeStateFromBase64Url } from './utils/algorithms';
+import { createInitialSystemState, DEFAULT_RUBRICS, DEFAULT_NOTICE_ITEMS } from './utils/demoData';
+import { decodeStateFromBase64Url, encodeStateToBase64Url } from './utils/algorithms';
 import { AdminDashboard } from './components/AdminDashboard';
 import { EventEvaluationPortal } from './components/EventEvaluationPortal';
 import { PrintSheetA4 } from './components/PrintSheetA4';
-import { RefreshCw, Globe, RotateCcw } from 'lucide-react';
+import { RefreshCw, Globe, RotateCcw, CheckCircle2, AlertCircle, X } from 'lucide-react';
 
-const STORAGE_KEY = 'service_credits_state_v2';
-const ADMIN_AUTH_KEY = 'service_credits_admin_auth_v1';
-const ADMIN_PASS_KEY = 'service_credits_admin_pass_v1';
-const BROADCAST_CHANNEL_NAME = 'service_credits_sync_channel';
+export const STORAGE_KEY = 'service_credits_state_v3';
+const LEGACY_KEYS = ['service_credits_state_v1', 'service_credits_state_v2'];
+const ADMIN_AUTH_KEY = 'service_credits_admin_auth_v3';
+const ADMIN_PASS_KEY = 'service_credits_admin_pass_v3';
+const BROADCAST_CHANNEL_NAME = 'service_credits_sync_channel_v3';
+
+export type ToastTone = 'success' | 'error';
 
 interface RouteParsed {
   mode: 'admin' | 'event';
@@ -23,7 +26,7 @@ interface RouteParsed {
   base64State: string | null;
 }
 
-function parseHashRoute(hashStr: string, defaultEventName: string): RouteParsed {
+export function parseHashRoute(hashStr: string, defaultEventName: string): RouteParsed {
   const raw = hashStr.startsWith('#') ? hashStr.slice(1) : hashStr;
   if (!raw || raw === '/' || raw.startsWith('/管理編輯')) {
     const qIdx = raw.indexOf('?s=');
@@ -35,7 +38,13 @@ function parseHashRoute(hashStr: string, defaultEventName: string): RouteParsed 
   }
 
   const [pathPart, queryPart] = raw.split('?');
-  const decodedPath = decodeURIComponent(pathPart.replace(/^\/+/, '')).trim();
+  let decodedPath = pathPart.replace(/^\/+/, '').trim();
+  try {
+    decodedPath = decodeURIComponent(decodedPath).trim();
+  } catch {
+    // keep raw pathPart if malformed URI
+  }
+
   let sParam: string | null = null;
   if (queryPart) {
     const params = new URLSearchParams(queryPart);
@@ -53,26 +62,170 @@ function parseHashRoute(hashStr: string, defaultEventName: string): RouteParsed 
   };
 }
 
-export default function App() {
-  // Load initial state from URL (?s=...) or localStorage or deterministic Demo Data
-  const [systemState, setSystemState] = useState<SystemState>(() => {
+/**
+ * 防呆正規化函式：確保任何載入的 EventSession 欄位皆完整合法，防止舊版髒資料造成 TypeError
+ */
+function normalizeEventSession(ev: EventSession): EventSession {
+  const participants = Array.isArray(ev.participants) ? ev.participants : [];
+  const rubrics =
+    Array.isArray(ev.rubrics) && ev.rubrics.length > 0
+      ? ev.rubrics.map((r, i) => ({
+          id: r.id || `rub-${i + 1}`,
+          title: r.title || `評核指標 ${i + 1}`,
+          maxScore: Number.isFinite(Number(r.maxScore)) ? Number(r.maxScore) : 10,
+          description: r.description || '',
+          tierHigh: r.tierHigh || '',
+          tierMedium: r.tierMedium || '',
+          tierLow: r.tierLow || '',
+        }))
+      : DEFAULT_RUBRICS.map((r) => ({ ...r }));
+
+  const progressMap: EventSession['progressMap'] = {};
+  for (const p of participants) {
+    const existing = ev.progressMap?.[p.id];
+    progressMap[p.id] = {
+      participantId: p.id,
+      hasDrawn: Boolean(existing?.hasDrawn),
+      hasEvaluated: Boolean(existing?.hasEvaluated),
+    };
+  }
+
+  const remainingPoolIds = Array.isArray(ev.remainingPoolIds)
+    ? ev.remainingPoolIds.filter((id) => participants.some((p) => p.id === id))
+    : participants.map((p) => p.id);
+
+  const ticketPool =
+    ev.ticketPool && typeof ev.ticketPool === 'object' ? { ...ev.ticketPool } : {};
+
+  const evaluations = Array.isArray(ev.evaluations) ? ev.evaluations : [];
+
+  return {
+    id: ev.id || `evt-${Date.now()}`,
+    name: ev.name || '活動A-迎新宿營',
+    academicYear: ev.academicYear || '115學年度',
+    period: ev.period || '115年09月01日 至 115年10月20日',
+    participants,
+    rubrics,
+    progressMap,
+    remainingPoolIds,
+    ticketPool,
+    evaluations,
+  };
+}
+
+function loadInitialState(): {
+  state: SystemState;
+  initialEventId: string;
+  hydratedS: string | null;
+} {
+  // Clear legacy v1/v2 keys to prevent incompatible JSON structure interference
+  if (typeof window !== 'undefined') {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved) as SystemState;
-        if (parsed && Array.isArray(parsed.events) && parsed.events.length > 0) {
-          return parsed;
-        }
+      for (const oldKey of LEGACY_KEYS) {
+        localStorage.removeItem(oldKey);
       }
     } catch {
-      // Fallback to initial demo state
+      // Ignore storage access errors
     }
-    return createInitialSystemState();
-  });
+  }
 
-  const [selectedEventId, setSelectedEventId] = useState<string>(
-    () => systemState.events[0]?.id || 'evt-115-a'
-  );
+  const fallback = createInitialSystemState();
+  let state: SystemState = fallback;
+  let initialEventId = fallback.events[0]?.id || 'evt-115-a';
+  let hydratedS: string | null = null;
+
+  // 1. Load from v3 localStorage
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved) as SystemState;
+      if (parsed && Array.isArray(parsed.events) && parsed.events.length > 0) {
+        state = {
+          events: parsed.events.map(normalizeEventSession),
+          noticeItems:
+            Array.isArray(parsed.noticeItems) && parsed.noticeItems.length > 0
+              ? parsed.noticeItems
+              : [...DEFAULT_NOTICE_ITEMS],
+          updatedDate: parsed.updatedDate || fallback.updatedDate,
+        };
+        initialEventId = state.events[0].id;
+      }
+    }
+  } catch {
+    state = fallback;
+  }
+
+  // 2. Only on initial mount: check if URL has a v3 ?s=... Base64 state
+  if (typeof window !== 'undefined') {
+    const parsedRoute = parseHashRoute(window.location.hash || '', initialEventId);
+    if (parsedRoute.base64State) {
+      hydratedS = parsedRoute.base64State;
+      const decoded = decodeStateFromBase64Url<{
+        v?: number;
+        event?: EventSession;
+        noticeItems?: string[];
+      }>(parsedRoute.base64State);
+
+      // Only accept v === 3 payloads so stale v1/v2 URLs never overwrite v3 state
+      if (decoded && decoded.v === 3 && decoded.event && decoded.event.id) {
+        const incomingEvent = normalizeEventSession(decoded.event);
+        const exists = state.events.some((e) => e.id === incomingEvent.id);
+        const mergedEvents = exists
+          ? state.events.map((e) => (e.id === incomingEvent.id ? incomingEvent : e))
+          : [...state.events, incomingEvent];
+        state = {
+          ...state,
+          events: mergedEvents,
+          noticeItems:
+            Array.isArray(decoded.noticeItems) && decoded.noticeItems.length > 0
+              ? decoded.noticeItems
+              : state.noticeItems,
+        };
+        initialEventId = incomingEvent.id;
+      }
+    }
+
+    if (parsedRoute.mode === 'event') {
+      const matched = state.events.find(
+        (e) => e.name === parsedRoute.eventName || e.id === parsedRoute.eventName
+      );
+      if (matched) {
+        initialEventId = matched.id;
+      }
+    }
+  }
+
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore
+  }
+
+  return { state, initialEventId, hydratedS };
+}
+
+export default function App() {
+  const initialData = useMemo(() => loadInitialState(), []);
+  const [systemState, setSystemState] = useState<SystemState>(initialData.state);
+  const [selectedEventId, setSelectedEventId] = useState<string>(initialData.initialEventId);
+  const lastHydratedSRef = useRef<string | null>(initialData.hydratedS);
+
+  // Toast notification state (supports 'success' green and 'error' red tones)
+  const [toastState, setToastState] = useState<{
+    message: string;
+    tone: ToastTone;
+  } | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
+
+  const showToast = useCallback((message: string, tone: ToastTone = 'success') => {
+    setToastState({ message, tone });
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToastState(null);
+    }, 4000);
+  }, []);
 
   // Admin auth state (persisted in sessionStorage for current session)
   const [adminPassword, setAdminPassword] = useState<string>(() => {
@@ -103,7 +256,7 @@ export default function App() {
     rubrics: RubricItem[];
   } | null>(null);
 
-  // BroadcastChannel & Storage synchronization
+  // BroadcastChannel & Storage synchronization across tabs
   useEffect(() => {
     let channel: BroadcastChannel | null = null;
     try {
@@ -111,7 +264,10 @@ export default function App() {
         channel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
         channel.onmessage = (ev) => {
           if (ev.data && Array.isArray(ev.data.events)) {
-            setSystemState(ev.data as SystemState);
+            setSystemState({
+              ...ev.data,
+              events: ev.data.events.map(normalizeEventSession),
+            });
           }
         };
       }
@@ -124,7 +280,10 @@ export default function App() {
         try {
           const next = JSON.parse(e.newValue) as SystemState;
           if (next && Array.isArray(next.events)) {
-            setSystemState(next);
+            setSystemState({
+              ...next,
+              events: next.events.map(normalizeEventSession),
+            });
           }
         } catch {
           // Ignore malformed storage
@@ -139,10 +298,25 @@ export default function App() {
     };
   }, []);
 
-  const updateSystemState = useCallback(
+  /**
+   * 統一封裝之狀態更新函式 updateActivitiesState:
+   * 純粹更新 systemState，並同步寫入 localStorage、BroadcastChannel 與 history.replaceState。
+   */
+  const updateActivitiesState = useCallback(
     (updater: (prev: SystemState) => SystemState) => {
       setSystemState((prev) => {
-        const next = updater(prev);
+        const rawNext = updater(prev);
+        const next: SystemState = {
+          ...rawNext,
+          events: Array.isArray(rawNext.events)
+            ? rawNext.events.map(normalizeEventSession)
+            : prev.events,
+          noticeItems:
+            Array.isArray(rawNext.noticeItems) && rawNext.noticeItems.length > 0
+              ? rawNext.noticeItems
+              : prev.noticeItems,
+        };
+
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
           if (typeof BroadcastChannel !== 'undefined') {
@@ -153,52 +327,115 @@ export default function App() {
         } catch {
           // Ignore storage quota errors
         }
+
+        // Silently synchronize URL via history.replaceState (without calling setState inside updater)
+        if (typeof window !== 'undefined') {
+          try {
+            const currentHash = window.location.hash || '#/管理編輯';
+            const parsed = parseHashRoute(
+              currentHash,
+              next.events[0]?.name || '活動A-迎新宿營'
+            );
+            if (parsed.mode === 'admin') {
+              const cleanAdminHash = '#/管理編輯';
+              if (window.location.hash !== cleanAdminHash) {
+                window.history.replaceState(null, '', cleanAdminHash);
+              }
+            } else {
+              const targetEv =
+                next.events.find(
+                  (e) => e.name === parsed.eventName || e.id === parsed.eventName
+                ) || next.events[0];
+              if (targetEv) {
+                const payload = {
+                  v: 3,
+                  activeEventId: targetEv.id,
+                  event: targetEv,
+                  noticeItems: next.noticeItems,
+                };
+                const encoded = encodeStateToBase64Url(payload);
+                lastHydratedSRef.current = encoded;
+                const nextEventHash = `#/${encodeURIComponent(targetEv.name)}?s=${encoded}`;
+                window.history.replaceState(null, '', nextEventHash);
+              }
+            }
+          } catch {
+            // Ignore history replaceState errors
+          }
+        }
+
         return next;
       });
     },
     []
   );
 
-  // Listen to hash changes & hydrate ?s=... Base64 URL state if present
+  // Listen to user-initiated hash changes ONLY
   useEffect(() => {
-    const syncFromHash = () => {
+    const handleHashChange = () => {
       const currentHash = window.location.hash || '#/管理編輯';
       setHashRoute(currentHash);
 
-      const parsed = parseHashRoute(
-        currentHash,
-        systemState.events[0]?.name || '活動A-迎新宿營'
-      );
+      const parsed = parseHashRoute(currentHash, '活動A-迎新宿營');
 
-      if (parsed.base64State) {
+      if (parsed.base64State && parsed.base64State !== lastHydratedSRef.current) {
+        lastHydratedSRef.current = parsed.base64State;
         const decoded = decodeStateFromBase64Url<{
           v?: number;
           event?: EventSession;
           noticeItems?: string[];
         }>(parsed.base64State);
 
-        if (decoded && decoded.event && decoded.event.id) {
-          const incomingEvent = decoded.event;
-          updateSystemState((prev) => {
+        if (decoded && decoded.v === 3 && decoded.event && decoded.event.id) {
+          const incomingEvent = normalizeEventSession(decoded.event);
+          setSystemState((prev) => {
             const exists = prev.events.some((e) => e.id === incomingEvent.id);
             const nextEvents = exists
               ? prev.events.map((e) => (e.id === incomingEvent.id ? incomingEvent : e))
               : [...prev.events, incomingEvent];
-            return {
+            const nextState: SystemState = {
               ...prev,
               events: nextEvents,
-              noticeItems: decoded.noticeItems || prev.noticeItems,
+              noticeItems:
+                Array.isArray(decoded.noticeItems) && decoded.noticeItems.length > 0
+                  ? decoded.noticeItems
+                  : prev.noticeItems,
             };
+            try {
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
+            } catch {
+              // Ignore
+            }
+            return nextState;
           });
           setSelectedEventId(incomingEvent.id);
         }
+      } else if (parsed.mode === 'event') {
+        setSystemState((prev) => {
+          const matched = prev.events.find(
+            (e) => e.name === parsed.eventName || e.id === parsed.eventName
+          );
+          if (matched) {
+            setSelectedEventId(matched.id);
+          }
+          return prev;
+        });
       }
     };
 
-    syncFromHash();
-    window.addEventListener('hashchange', syncFromHash);
-    return () => window.removeEventListener('hashchange', syncFromHash);
-  }, [systemState.events, updateSystemState]);
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  // Ensure selectedEventId always points to an existing event
+  useEffect(() => {
+    if (
+      systemState.events.length > 0 &&
+      !systemState.events.some((e) => e.id === selectedEventId)
+    ) {
+      setSelectedEventId(systemState.events[0].id);
+    }
+  }, [systemState.events, selectedEventId]);
 
   const parsedRoute = useMemo(
     () =>
@@ -222,25 +459,57 @@ export default function App() {
     );
   }, [parsedRoute, systemState.events, selectedEventId]);
 
-  const navigateToHash = (targetHash: string) => {
-    window.location.hash = targetHash;
+  const navigateToHash = useCallback((targetHash: string) => {
+    if (typeof window !== 'undefined') {
+      window.location.hash = targetHash;
+    }
     setHashRoute(targetHash);
-  };
+  }, []);
 
   const handleResetDemoData = () => {
     const fresh = createInitialSystemState();
-    updateSystemState(() => fresh);
+    lastHydratedSRef.current = null;
+    updateActivitiesState(() => fresh);
     setSelectedEventId(fresh.events[0].id);
+    showToast('已重置為預設展示資料（活動A-迎新宿營、活動B-期末系大）', 'success');
   };
 
   // Logical URL Indicator text required by specification
   const logicalUrlIndicator =
     parsedRoute.mode === 'admin'
       ? '網址.服務點數評分.管理編輯'
-      : `Service credits - 網址.服務點數評分.${activeEventForPortal.name}`;
+      : `Service credits - 網址.服務點數評分.${activeEventForPortal?.name || '活動A-迎新宿營'}`;
 
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+      {/* Global Non-Blocking Toast Notification Bar */}
+      {toastState && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 text-xs font-semibold text-white rounded-lg shadow-lg border no-print ${
+            toastState.tone === 'error'
+              ? 'bg-red-700 border-red-600'
+              : 'bg-emerald-800 border-emerald-700'
+          }`}
+        >
+          {toastState.tone === 'error' ? (
+            <AlertCircle className="w-4 h-4 text-red-200 shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-300 shrink-0" />
+          )}
+          <span>{toastState.message}</span>
+          <button
+            type="button"
+            onClick={() => setToastState(null)}
+            aria-label="關閉通知"
+            className="p-0.5 text-white/80 hover:text-white cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Main Application Shell (Hidden during A4 @media print when PrintSheetA4 is open) */}
       <div className={printTarget ? 'no-print' : ''}>
         {/* Top Bar Contract: 1-row, 3-zone header */}
@@ -278,7 +547,7 @@ export default function App() {
             </a>
             {systemState.events.slice(0, 4).map((ev) => {
               const isCurrentEvent =
-                parsedRoute.mode === 'event' && activeEventForPortal.id === ev.id;
+                parsedRoute.mode === 'event' && activeEventForPortal?.id === ev.id;
               return (
                 <a
                   key={ev.id}
@@ -343,7 +612,7 @@ export default function App() {
 
                 {systemState.events.map((ev) => {
                   const isActive =
-                    parsedRoute.mode === 'event' && activeEventForPortal.id === ev.id;
+                    parsedRoute.mode === 'event' && activeEventForPortal?.id === ev.id;
                   return (
                     <button
                       key={ev.id}
@@ -393,13 +662,14 @@ export default function App() {
               systemState={systemState}
               selectedEventId={selectedEventId}
               onSelectEvent={setSelectedEventId}
-              onUpdateState={updateSystemState}
+              onUpdateState={updateActivitiesState}
               onNavigateToEvent={(evName) =>
                 navigateToHash(`#/${encodeURIComponent(evName)}`)
               }
               onOpenPrintModal={(eventName, record, rubrics) =>
                 setPrintTarget({ eventName, record, rubrics })
               }
+              onShowToast={showToast}
               isAdminAuthenticated={isAdminAuthenticated}
               adminPassword={adminPassword}
               onLoginSuccess={() => {
@@ -409,6 +679,7 @@ export default function App() {
                 } catch {
                   // Ignore
                 }
+                showToast('已驗證管理員身分並進入管理後台', 'success');
               }}
               onLogout={() => {
                 setIsAdminAuthenticated(false);
@@ -417,6 +688,7 @@ export default function App() {
                 } catch {
                   // Ignore
                 }
+                showToast('已登出管理後台', 'success');
               }}
               onChangePassword={(newPass) => {
                 setAdminPassword(newPass);
@@ -425,6 +697,7 @@ export default function App() {
                 } catch {
                   // Ignore
                 }
+                showToast('管理員密碼已更新', 'success');
               }}
             />
           ) : (
@@ -432,7 +705,9 @@ export default function App() {
               key={activeEventForPortal.id}
               event={activeEventForPortal}
               noticeItems={systemState.noticeItems}
-              onUpdateState={updateSystemState}
+              onUpdateState={updateActivitiesState}
+              onShowToast={showToast}
+              onNavigateToAdmin={() => navigateToHash('#/管理編輯')}
             />
           )}
         </main>

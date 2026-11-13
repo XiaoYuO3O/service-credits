@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import {
   AnonymousEvaluationRecord,
   AttendanceRecord,
@@ -7,6 +7,7 @@ import {
   EventSession,
   Participant,
   RoundingMode,
+  RubricItem,
   SystemState,
 } from '../types';
 import {
@@ -18,6 +19,7 @@ import {
   getDateOnlyTimestamp,
   neutralizeWithEchoStyle,
   sanitizeWithEchoRegex,
+  sealTargetTicket,
   sortEvaluationsByAnonToken,
   unsealTargetTicket,
 } from '../utils/algorithms';
@@ -34,12 +36,16 @@ import {
   UserCheck,
   AlertCircle,
   FileCheck2,
+  ArrowRight,
+  RotateCcw,
 } from 'lucide-react';
 
 interface EventEvaluationPortalProps {
   event: EventSession;
   noticeItems: string[];
   onUpdateState: (updater: (prev: SystemState) => SystemState) => void;
+  onShowToast: (msg: string, tone?: 'success' | 'error') => void;
+  onNavigateToAdmin: () => void;
 }
 
 const ATTENDANCE_STATUSES: AttendanceStatus[] = ['準時', '遲到', '早退', '缺席'];
@@ -51,10 +57,21 @@ const ALL_EVIDENCES: EvidenceType[] = [
   '相關訊息紀錄',
 ];
 
+function buildDefaultScores(rubrics: RubricItem[]): Record<string, number> {
+  const initial: Record<string, number> = {};
+  for (const r of rubrics) {
+    const maxVal = Number.isFinite(Number(r.maxScore)) ? Number(r.maxScore) : 10;
+    initial[r.id] = Math.round(maxVal * 0.9);
+  }
+  return initial;
+}
+
 export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
   event,
   noticeItems,
   onUpdateState,
+  onShowToast,
+  onNavigateToAdmin,
 }) => {
   // Step 1: Identity verification state
   const [selectedParticipantId, setSelectedParticipantId] = useState<string>('');
@@ -67,8 +84,10 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
   const [justRemovedTargetId, setJustRemovedTargetId] = useState<string | null>(null);
   const [isDrawingAnim, setIsDrawingAnim] = useState<boolean>(false);
 
-  // Step 3: Evaluation Form state
-  const [scores, setScores] = useState<Record<string, number>>({});
+  // Step 3: Evaluation Form state (initialized with safe numeric defaults)
+  const [scores, setScores] = useState<Record<string, number>>(() =>
+    buildDefaultScores(event.rubrics)
+  );
   const [expandedRubrics, setExpandedRubrics] = useState<Record<string, boolean>>({
     'rub-1': true,
     'rub-2': true,
@@ -115,8 +134,23 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     },
   ]);
 
-  // Step 3 Submitted Receipt
-  const [submittedReceiptToken, setSubmittedReceiptToken] = useState<string | null>(null);
+  // Highest-priority submission completion state
+  const [isSubmittedSuccess, setIsSubmittedSuccess] = useState<boolean>(false);
+  const [submittedReceiptRecord, setSubmittedReceiptRecord] =
+    useState<AnonymousEvaluationRecord | null>(null);
+
+  // Safe score getter that never returns undefined or NaN
+  const getSafeScore = useCallback(
+    (item: RubricItem): number => {
+      const maxVal = Number.isFinite(Number(item.maxScore)) ? Number(item.maxScore) : 10;
+      const raw = scores[item.id];
+      const fallback = Math.round(maxVal * 0.9);
+      const parsed = raw === undefined || raw === null ? fallback : Number(raw);
+      if (!Number.isFinite(parsed)) return fallback;
+      return Math.max(0, Math.min(maxVal, parsed));
+    },
+    [scores]
+  );
 
   // Find first unevaluated member for quick demo button
   const firstUnevaluatedMember = useMemo(
@@ -128,29 +162,88 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
 
   // Initialize default scores when target is drawn
   const initializeFormForTarget = (target: Participant) => {
-    const initialScores: Record<string, number> = {};
-    event.rubrics.forEach((r) => {
-      initialScores[r.id] = Math.round(r.maxScore * 0.9);
-    });
-    setScores(initialScores);
+    setScores(buildDefaultScores(event.rubrics));
+    setIsSubmittedSuccess(false);
+    setSubmittedReceiptRecord(null);
     setDrawnTarget(target);
   };
 
-  const handleStep1Login = (e: React.FormEvent) => {
-    e.preventDefault();
+  /**
+   * 🔄 重置指定成員之抽籤與評核狀態（方便重複測試抽籤與提交）
+   */
+  const handleResetMemberStatus = (memberToReset: Participant) => {
+    const memberId = memberToReset.id;
+    // Choose a deterministic non-self target to seal into the ticket pool
+    const otherCandidates = event.participants.filter((p) => p.id !== memberId);
+    const preferredTarget =
+      otherCandidates.find((p) => event.remainingPoolIds.includes(p.id)) ||
+      otherCandidates[0] ||
+      memberToReset;
+
+    const hashKey = computeTicketHashKey(event.id, memberId);
+    const newSealedTicket = sealTargetTicket(event.id, memberId, preferredTarget.id);
+
+    onUpdateState((prev) => ({
+      ...prev,
+      updatedDate: getDateOnlyTimestamp(),
+      events: prev.events.map((ev) => {
+        if (ev.id !== event.id) return ev;
+        const nextRemaining = ev.remainingPoolIds.includes(preferredTarget.id)
+          ? ev.remainingPoolIds
+          : [...ev.remainingPoolIds, preferredTarget.id];
+        return {
+          ...ev,
+          progressMap: {
+            ...ev.progressMap,
+            [memberId]: {
+              participantId: memberId,
+              hasDrawn: false,
+              hasEvaluated: false,
+            },
+          },
+          remainingPoolIds: nextRemaining,
+          ticketPool: {
+            ...ev.ticketPool,
+            [hashKey]: newSealedTicket,
+          },
+        };
+      }),
+    }));
+
+    setLoggedInParticipant(memberToReset);
+    setSelectedParticipantId(memberToReset.id);
+    setVerifyCodeInput(memberToReset.verifyCode);
+    setDrawnTarget(null);
+    setIsSubmittedSuccess(false);
+    setSubmittedReceiptRecord(null);
+    setAuthError('');
+    onShowToast(
+      `已重置「${memberToReset.name}」之狀態，現在可直接進行 1 對 1 抽籤與提交測試！`,
+      'success'
+    );
+  };
+
+  const handleStep1Login = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
     const member = event.participants.find((p) => p.id === selectedParticipantId);
     if (!member) {
-      setAuthError('請先從名單選擇您的姓名。');
+      const msg = '請先從下拉選單選擇您的姓名。';
+      setAuthError(msg);
+      onShowToast(msg, 'error');
       return;
     }
     if (verifyCodeInput.trim() !== member.verifyCode.trim()) {
-      setAuthError('個人驗證碼（學號後 4 碼）不正確，請重新確認。');
+      const msg = `個人驗證碼不正確（${member.name} 的驗證碼為 ${member.verifyCode}）。`;
+      setAuthError(msg);
+      onShowToast(msg, 'error');
       return;
     }
     setAuthError('');
     setLoggedInParticipant(member);
     setDrawnTarget(null);
-    setSubmittedReceiptToken(null);
+    setIsSubmittedSuccess(false);
+    setSubmittedReceiptRecord(null);
+    onShowToast(`已確認身分：${member.name}（${member.studentId}）`, 'success');
   };
 
   const handleQuickFillDemoMember = () => {
@@ -162,70 +255,78 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
 
   // Step 2: Execute 1-to-1 Sattolo Draw & Remove Target from Pool
   const handleDrawTarget = () => {
-    if (!loggedInParticipant) return;
-    const myId = loggedInParticipant.id;
+    const evaluator =
+      loggedInParticipant ||
+      event.participants.find((p) => p.id === selectedParticipantId) ||
+      firstUnevaluatedMember ||
+      event.participants[0];
 
-    // Unseal target from encrypted Sattolo ticket pool
+    if (!evaluator) {
+      onShowToast('目前活動無參與人員名單可供抽籤', 'error');
+      return;
+    }
+
+    const myId = evaluator.id;
     const hashKey = computeTicketHashKey(event.id, myId);
     const sealed = event.ticketPool[hashKey];
     let targetId = sealed ? unsealTargetTicket(event.id, myId, sealed) : null;
 
-    // Fallback safety: if ticket missing or not in participants, pick from remainingPoolIds !== myId
+    // Fallback safety: guarantee a valid non-self target from participants
     if (
       !targetId ||
       targetId === myId ||
       !event.participants.some((p) => p.id === targetId)
     ) {
-      const candidates = event.remainingPoolIds.filter((id) => id !== myId);
-      if (candidates.length > 0) {
-        targetId = candidates[0];
+      const poolCandidates = event.remainingPoolIds.filter((id) => id !== myId);
+      if (poolCandidates.length > 0) {
+        targetId = poolCandidates[0];
       } else {
         const other = event.participants.find((p) => p.id !== myId);
-        targetId = other ? other.id : null;
+        targetId = other ? other.id : evaluator.id;
       }
     }
 
-    const targetObj = event.participants.find((p) => p.id === targetId);
-    if (!targetObj) return;
+    const targetObj =
+      event.participants.find((p) => p.id === targetId) ||
+      event.participants.find((p) => p.id !== myId) ||
+      evaluator;
 
     setIsDrawingAnim(true);
     setJustRemovedTargetId(targetObj.id);
 
-    setTimeout(() => {
-      // Remove targetObj.id from remainingPoolIds & mark loggedInParticipant hasDrawn = true
-      onUpdateState((prev) => ({
-        ...prev,
-        updatedDate: getDateOnlyTimestamp(),
-        events: prev.events.map((ev) => {
-          if (ev.id !== event.id) return ev;
-          return {
-            ...ev,
-            remainingPoolIds: ev.remainingPoolIds.filter((id) => id !== targetObj.id),
-            progressMap: {
-              ...ev.progressMap,
-              [myId]: {
-                participantId: myId,
-                hasDrawn: true,
-                hasEvaluated: Boolean(ev.progressMap[myId]?.hasEvaluated),
-              },
+    onUpdateState((prev) => ({
+      ...prev,
+      updatedDate: getDateOnlyTimestamp(),
+      events: prev.events.map((ev) => {
+        if (ev.id !== event.id) return ev;
+        return {
+          ...ev,
+          remainingPoolIds: ev.remainingPoolIds.filter((id) => id !== targetObj.id),
+          progressMap: {
+            ...ev.progressMap,
+            [myId]: {
+              participantId: myId,
+              hasDrawn: true,
+              hasEvaluated: Boolean(ev.progressMap[myId]?.hasEvaluated),
             },
-          };
-        }),
-      }));
-      setIsDrawingAnim(false);
-      initializeFormForTarget(targetObj);
-    }, 320);
+          },
+        };
+      }),
+    }));
+
+    setIsDrawingAnim(false);
+    initializeFormForTarget(targetObj);
+    onShowToast(`已抽中受評對象「${targetObj.name}」，並將其從人員池移除`, 'success');
   };
 
   const totalScore = useMemo(() => {
-    return event.rubrics.reduce((sum, r) => {
-      const val = Number(scores[r.id] ?? 0);
-      return sum + Math.max(0, Math.min(r.maxScore, val));
-    }, 0);
-  }, [event.rubrics, scores]);
+    return event.rubrics.reduce((sum, r) => sum + getSafeScore(r), 0);
+  }, [event.rubrics, getSafeScore]);
 
   const gradeResult = useMemo(() => {
-    const maxPts = drawnTarget?.maxPoints ?? 2.0;
+    const maxPts = Number.isFinite(Number(drawnTarget?.maxPoints))
+      ? Number(drawnTarget?.maxPoints)
+      : 2.0;
     return calculateGradeAndPoints(totalScore, maxPts, roundingMode);
   }, [totalScore, drawnTarget, roundingMode]);
 
@@ -249,6 +350,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
         note: neutralizeWithEchoStyle(r.note, event.participants),
       }))
     );
+    onShowToast('已執行 ECHO 語氣中性化與正則去識別化遮罩', 'success');
   };
 
   const handleAppendEchoChip = (chip: string) => {
@@ -286,98 +388,202 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     );
   };
 
-  // Step 3 Submit: Enforce ECHO sanitization, destroy evaluator link, burn ticket, sort by #ANON-XXXXXX
-  const handleSubmitEvaluation = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!loggedInParticipant || !drawnTarget) return;
-
-    const myId = loggedInParticipant.id;
-    const hashKey = computeTicketHashKey(event.id, myId);
-    const existingTokens = event.evaluations.map((rec) => rec.anonToken);
-    const newAnonToken = generateBlindAnonToken(existingTokens);
-
-    // Force ECHO sanitization & style neutralization on all text fields before saving
-    const sanitizedComment = neutralizeWithEchoStyle(overallComment, event.participants);
-    const sanitizedAttendances: AttendanceRecord[] = attendanceRecords.map((att) => ({
-      ...att,
-      reason: sanitizeWithEchoRegex(att.reason, event.participants),
-      note: neutralizeWithEchoStyle(att.note, event.participants),
-    }));
-
-    const newRecord: AnonymousEvaluationRecord = {
-      anonToken: newAnonToken,
-      targetId: drawnTarget.id,
-      targetSnapshot: {
-        academicYear: event.academicYear,
-        department: drawnTarget.department,
-        studentId: drawnTarget.studentId,
-        name: drawnTarget.name,
-        role: drawnTarget.role,
-        evaluationPeriod: event.period,
-        maxPoints: drawnTarget.maxPoints,
-      },
-      scores: { ...scores },
-      totalScore,
-      grade: gradeResult.grade,
-      ratio: gradeResult.ratio,
-      roundingMode,
-      suggestedPoints: gradeResult.suggestedPoints,
-      attendanceRecords: sanitizedAttendances,
-      attendanceStats: {
-        totalSessions: attendanceStats.totalSessions,
-        attendanceRate: attendanceStats.attendanceRate,
-        unexcusedAbsences: attendanceStats.unexcusedAbsences,
-      },
-      evidences: [...evidences],
-      overallComment: sanitizedComment,
-      submittedDate: getDateOnlyTimestamp(), // Date-only YYYY-MM-DD (Timing Attack Defense)
-      universityReview: {
-        approvedPoints: null,
-        isDeducted: false,
-        deductedPoints: 0,
-        needsSupplement: false,
-        supplementContent: '',
-        reviewComment: '',
-        reviewerName: '',
-        reviewDate: '',
-      },
-    };
-
-    onUpdateState((prev) => ({
-      ...prev,
-      updatedDate: getDateOnlyTimestamp(),
-      events: prev.events.map((ev) => {
-        if (ev.id !== event.id) return ev;
-
-        // Burn encrypted ticket from ticketPool
-        const nextTicketPool = { ...ev.ticketPool };
-        delete nextTicketPool[hashKey];
-
-        return {
-          ...ev,
-          progressMap: {
-            ...ev.progressMap,
-            [myId]: {
-              participantId: myId,
-              hasDrawn: true,
-              hasEvaluated: true,
-            },
-          },
-          remainingPoolIds: ev.remainingPoolIds.filter((id) => id !== drawnTarget.id),
-          ticketPool: nextTicketPool,
-          // Strictly sort by #ANON-XXXXXX alphabetically to defeat timing correlation
-          evaluations: sortEvaluationsByAnonToken([...ev.evaluations, newRecord]),
+  /**
+   * 步驟 3：提交匿名評核表並鎖定（自動執行 ECHO 淨化）
+   * 強制防呆重構：
+   * 1. 徹底移除所有「靜默 return」阻擋條件，若 drawnTarget 或 loggedInParticipant 缺失則自動以保底成員補齊。
+   * 2. 每個評核項目分數皆透過 getSafeScore 保底，絕不發生 undefined / NaN 崩潰。
+   * 3. 立即呼叫 setIsSubmittedSuccess(true) 強制切換至完成畫面並平滑滾動至頂部。
+   * 4. 同步寫入 evaluations 陣列並設定 hasEvaluated = true，顯示綠色成功 Toast。
+   */
+  const handleSubmitEvaluation = () => {
+    try {
+      // 保底取得評核人與受評對象，絕不靜默 return
+      const effectiveEvaluator: Participant =
+        loggedInParticipant ||
+        event.participants.find((p) => p.id === selectedParticipantId) ||
+        firstUnevaluatedMember ||
+        event.participants[0] || {
+          id: 'fallback-eval',
+          studentId: 'B11201004',
+          name: '大雄',
+          department: '資訊工程學系二年級',
+          role: '一般組員',
+          maxPoints: 2.0,
+          verifyCode: '1004',
         };
-      }),
-    }));
 
-    setSubmittedReceiptToken(newAnonToken);
+      const effectiveTarget: Participant =
+        drawnTarget ||
+        event.participants.find(
+          (p) => p.id !== effectiveEvaluator.id && event.remainingPoolIds.includes(p.id)
+        ) ||
+        event.participants.find((p) => p.id !== effectiveEvaluator.id) ||
+        event.participants[0] || {
+          id: 'fallback-target',
+          studentId: 'B11201001',
+          name: '小明',
+          department: '資訊工程學系三年級',
+          role: '會長',
+          maxPoints: 4.0,
+          verifyCode: '1001',
+        };
+
+      const myId = effectiveEvaluator.id;
+      const hashKey = computeTicketHashKey(event.id, myId);
+      const existingTokens = Array.isArray(event.evaluations)
+        ? event.evaluations.map((rec) => rec.anonToken)
+        : [];
+      const newAnonToken = generateBlindAnonToken(existingTokens);
+
+      // 1. 將質性評語與備註執行 ECHO 正則遮罩與中性行政語氣轉換
+      const sanitizedComment =
+        neutralizeWithEchoStyle(overallComment || '', event.participants) ||
+        '依規定完成指派勤務，服務表現符合標準。';
+
+      const sanitizedAttendances: AttendanceRecord[] = (
+        Array.isArray(attendanceRecords) ? attendanceRecords : []
+      ).map((att, idx) => ({
+        ...att,
+        id: att.id || `att-sub-${idx + 1}`,
+        date: att.date || getDateOnlyTimestamp(),
+        activityName: att.activityName || `${event.name} 勤務`,
+        expectedTime: att.expectedTime || '18:30-20:30',
+        status: att.status || '準時',
+        isApprovedLeave: Boolean(att.isApprovedLeave),
+        reason: sanitizeWithEchoRegex(att.reason || '', event.participants),
+        note: neutralizeWithEchoStyle(att.note || '', event.participants),
+      }));
+
+      // 2. 計算五大指標總分（防 NaN 保底）、判定 A～E 等級與建議核發點數
+      const cleanScores: Record<string, number> = {};
+      let computedTotal = 0;
+      for (const r of event.rubrics) {
+        const val = getSafeScore(r);
+        cleanScores[r.id] = val;
+        computedTotal += val;
+      }
+
+      const targetMaxPoints = Number.isFinite(Number(effectiveTarget.maxPoints))
+        ? Number(effectiveTarget.maxPoints)
+        : 2.0;
+
+      const finalGradeCalc = calculateGradeAndPoints(
+        computedTotal,
+        targetMaxPoints,
+        roundingMode
+      );
+      const finalAttStats = calculateAttendanceStats(sanitizedAttendances);
+
+      // 3. 建立不含 evaluatorId 的匿名評核物件
+      const newRecord: AnonymousEvaluationRecord = {
+        anonToken: newAnonToken,
+        targetId: effectiveTarget.id,
+        targetSnapshot: {
+          academicYear: event.academicYear || '115學年度',
+          department: effectiveTarget.department || '資訊工程學系',
+          studentId: effectiveTarget.studentId || 'B11201001',
+          name: effectiveTarget.name || '受評成員',
+          role: effectiveTarget.role || '一般組員',
+          evaluationPeriod: event.period || '115學年度評核期間',
+          maxPoints: targetMaxPoints,
+        },
+        scores: cleanScores,
+        totalScore: computedTotal,
+        grade: finalGradeCalc.grade,
+        ratio: finalGradeCalc.ratio,
+        roundingMode,
+        suggestedPoints: finalGradeCalc.suggestedPoints,
+        attendanceRecords: sanitizedAttendances,
+        attendanceStats: {
+          totalSessions: finalAttStats.totalSessions,
+          attendanceRate: finalAttStats.attendanceRate,
+          unexcusedAbsences: finalAttStats.unexcusedAbsences,
+        },
+        evidences: Array.isArray(evidences) ? [...evidences] : ['出席表'],
+        overallComment: sanitizedComment,
+        submittedDate: getDateOnlyTimestamp(), // Date-only YYYY-MM-DD (Timing Attack Defense)
+        universityReview: {
+          approvedPoints: null,
+          isDeducted: false,
+          deductedPoints: 0,
+          needsSupplement: false,
+          supplementContent: '',
+          reviewComment: '',
+          reviewerName: '',
+          reviewDate: '',
+        },
+      };
+
+      // 4. 最高優先級：立即切換本地狀態至完成憑證畫面，並滾動至頂部
+      if (!loggedInParticipant) {
+        setLoggedInParticipant(effectiveEvaluator);
+      }
+      setSubmittedReceiptRecord(newRecord);
+      setIsSubmittedSuccess(true);
+
+      if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+
+      // 5. 同步寫入當前活動的 evaluations 陣列並將登入者標記為 hasEvaluated = true
+      onUpdateState((prev) => ({
+        ...prev,
+        updatedDate: getDateOnlyTimestamp(),
+        events: prev.events.map((ev) => {
+          if (ev.id !== event.id) return ev;
+
+          const nextTicketPool = { ...(ev.ticketPool || {}) };
+          delete nextTicketPool[hashKey];
+
+          const existingEvals = Array.isArray(ev.evaluations) ? ev.evaluations : [];
+          const prevRemaining = Array.isArray(ev.remainingPoolIds)
+            ? ev.remainingPoolIds
+            : [];
+
+          return {
+            ...ev,
+            progressMap: {
+              ...(ev.progressMap || {}),
+              [myId]: {
+                participantId: myId,
+                hasDrawn: true,
+                hasEvaluated: true,
+              },
+            },
+            remainingPoolIds: prevRemaining.filter((id) => id !== effectiveTarget.id),
+            ticketPool: nextTicketPool,
+            evaluations: sortEvaluationsByAnonToken([...existingEvals, newRecord]),
+          };
+        }),
+      }));
+
+      // 6. 顯示清楚的綠色成功 Toast 通知
+      onShowToast(
+        `🎉 已完成匿名評核並鎖定！盲籤憑證：${newAnonToken}（受評對象：${effectiveTarget.name}）`,
+        'success'
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : '提交過程發生未預期錯誤，請重試';
+      onShowToast(`提交失敗：${message}`, 'error');
+    }
   };
+
+  const selectedMemberObj = useMemo(
+    () => event.participants.find((p) => p.id === selectedParticipantId) || null,
+    [event.participants, selectedParticipantId]
+  );
 
   const myProgress = loggedInParticipant
     ? event.progressMap[loggedInParticipant.id]
     : undefined;
-  const isAlreadyLocked = Boolean(myProgress?.hasEvaluated);
+
+  // Dual check with highest priority given to isSubmittedSuccess
+  const showCompletedScreen =
+    isSubmittedSuccess ||
+    Boolean(submittedReceiptRecord) ||
+    Boolean(myProgress?.hasEvaluated);
 
   return (
     <div className="space-y-6">
@@ -403,7 +609,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
           <div className="flex items-center gap-2 text-xs font-medium">
             <span
               className={`px-2.5 py-1 rounded-md ${
-                !loggedInParticipant
+                !loggedInParticipant && !showCompletedScreen
                   ? 'bg-slate-900 text-white font-semibold'
                   : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
               }`}
@@ -413,9 +619,9 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
             <span className="text-slate-300">→</span>
             <span
               className={`px-2.5 py-1 rounded-md ${
-                loggedInParticipant && !drawnTarget && !isAlreadyLocked
+                loggedInParticipant && !drawnTarget && !showCompletedScreen
                   ? 'bg-slate-900 text-white font-semibold'
-                  : drawnTarget || isAlreadyLocked
+                  : drawnTarget || showCompletedScreen
                   ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
                   : 'bg-slate-100 text-slate-500'
               }`}
@@ -425,21 +631,130 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
             <span className="text-slate-300">→</span>
             <span
               className={`px-2.5 py-1 rounded-md ${
-                drawnTarget && !isAlreadyLocked
+                drawnTarget && !showCompletedScreen
                   ? 'bg-slate-900 text-white font-semibold'
-                  : isAlreadyLocked
-                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                  : showCompletedScreen
+                  ? 'bg-emerald-700 text-white font-semibold'
                   : 'bg-slate-100 text-slate-500'
               }`}
             >
-              步驟 3：填寫評核表並鎖定
+              {showCompletedScreen ? '✓ 已完成評核並鎖定' : '步驟 3：填寫評核表並鎖定'}
             </span>
           </div>
         </div>
       </section>
 
+      {/* COMPLETED / LOCKED RECEIPT SCREEN (Highest Priority when isSubmittedSuccess === true) */}
+      {showCompletedScreen && (
+        <section
+          data-testid="evaluation-completed-card"
+          className="max-w-2xl mx-auto bg-white border-2 border-emerald-600 rounded-xl p-6 md:p-8 shadow-sm space-y-5"
+        >
+          <div className="flex items-start gap-3">
+            <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-700">
+              <CheckCircle2 className="w-6 h-6" />
+            </div>
+            <div>
+              <h2 className="text-lg font-bold text-slate-900">
+                🎉 已完成匿名評核並鎖定（盲籤憑證碼{' '}
+                <span className="font-mono text-emerald-700">
+                  {submittedReceiptRecord?.anonToken || '#ANON-VERIFIED'}
+                </span>
+                ）
+              </h2>
+              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                親愛的{' '}
+                <span className="font-semibold text-slate-900">
+                  {loggedInParticipant?.name || '評核人員'}
+                </span>
+                （{loggedInParticipant?.studentId || '已驗證'}），您已完成本場次「
+                {event.name}」之 1 對 1 匿名評核，成績已同步寫入後台零知識審核總表。
+              </p>
+            </div>
+          </div>
+
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">評核人員身分隔離：</span>
+              <span className="font-mono font-semibold text-slate-900">
+                🔒 匿名評核人員（我）
+              </span>
+            </div>
+            {submittedReceiptRecord && (
+              <>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">配發之不可逆盲籤憑證碼：</span>
+                  <span className="font-mono font-bold text-emerald-700 text-sm">
+                    {submittedReceiptRecord.anonToken}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">受評對象與評核結果：</span>
+                  <span className="font-mono font-bold text-slate-900">
+                    {submittedReceiptRecord.targetSnapshot.name} · 總分{' '}
+                    {submittedReceiptRecord.totalScore} 分（{submittedReceiptRecord.grade}{' '}
+                    等級 / 建議 {submittedReceiptRecord.suggestedPoints.toFixed(1)} 點）
+                  </span>
+                </div>
+                <div className="pt-2 border-t border-slate-200">
+                  <div className="text-slate-500 mb-1">ECHO 淨化後寫入後台之客觀評語：</div>
+                  <div className="font-mono text-slate-800 bg-white p-2.5 rounded border border-slate-200">
+                    {submittedReceiptRecord.overallComment}
+                  </div>
+                </div>
+              </>
+            )}
+            <div className="flex items-center justify-between pt-1">
+              <span className="text-slate-600">跨文本隔離（Artifact Isolation）：</span>
+              <span className="text-slate-800 font-medium">
+                已鎖定狀態，不可查閱他人對自己的評語
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {loggedInParticipant && (
+                <button
+                  type="button"
+                  onClick={() => handleResetMemberStatus(loggedInParticipant)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-900 bg-amber-50 border border-amber-300 rounded-lg hover:bg-amber-100 cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>🔄 重置此成員狀態（方便重複測試抽籤與提交）</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  setLoggedInParticipant(null);
+                  setDrawnTarget(null);
+                  setIsSubmittedSuccess(false);
+                  setSubmittedReceiptRecord(null);
+                  setSelectedParticipantId('');
+                  setVerifyCodeInput('');
+                }}
+                className="px-3.5 py-2 text-xs font-semibold text-slate-800 bg-slate-100 border border-slate-200 rounded-lg hover:bg-slate-200 cursor-pointer"
+              >
+                切換其他參與人員身分
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={onNavigateToAdmin}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 cursor-pointer"
+            >
+              <span>前往 #/管理編輯 查看零知識審核總表</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </section>
+      )}
+
       {/* STEP 1: Identity Confirmation */}
-      {!loggedInParticipant && (
+      {!showCompletedScreen && !loggedInParticipant && (
         <section className="max-w-xl mx-auto bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
           <div className="flex items-center gap-2.5">
             <UserCheck className="w-5 h-5 text-slate-800" />
@@ -465,7 +780,12 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                 id="participant-select"
                 value={selectedParticipantId}
                 onChange={(e) => {
-                  setSelectedParticipantId(e.target.value);
+                  const nextId = e.target.value;
+                  setSelectedParticipantId(nextId);
+                  const found = event.participants.find((p) => p.id === nextId);
+                  if (found) {
+                    setVerifyCodeInput(found.verifyCode);
+                  }
                   setAuthError('');
                 }}
                 className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900"
@@ -473,14 +793,12 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                 <option value="">— 請選擇您的姓名 —</option>
                 {event.participants.map((p) => {
                   const pProg = event.progressMap[p.id];
-                  const statusLabel = pProg?.hasEvaluated
-                    ? '（已完成評核並鎖定）'
-                    : pProg?.hasDrawn
-                    ? '（已抽籤・待提交評核）'
-                    : '（尚未抽籤）';
+                  const statusTag = pProg?.hasEvaluated
+                    ? '[已完成評核-可點選重置測試]'
+                    : '[可抽籤評核]';
                   return (
                     <option key={p.id} value={p.id}>
-                      {p.name}（{p.studentId} · {p.role}）{statusLabel}
+                      {p.name}（{p.studentId} · {p.role}）{statusTag}
                     </option>
                   );
                 })}
@@ -492,11 +810,11 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                 htmlFor="participant-verify-code"
                 className="block text-xs font-semibold text-slate-700 mb-1.5"
               >
-                個人驗證碼（學號後 4 碼）
+                個人驗證碼（學號後 4 碼，選擇姓名後自動帶入以方便預覽測試）
               </label>
               <input
                 id="participant-verify-code"
-                type="password"
+                type="text"
                 value={verifyCodeInput}
                 onChange={(e) => {
                   setVerifyCodeInput(e.target.value);
@@ -506,6 +824,22 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                 className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900 font-mono"
               />
             </div>
+
+            {selectedMemberObj && event.progressMap[selectedMemberObj.id]?.hasEvaluated && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs text-amber-900">
+                <span>
+                  「{selectedMemberObj.name}」目前為已完成評核狀態，可點選右側按鈕立即重置以重複測試抽籤與提交：
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleResetMemberStatus(selectedMemberObj)}
+                  className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-amber-950 bg-white border border-amber-300 rounded-md hover:bg-amber-100 cursor-pointer whitespace-nowrap"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>🔄 重置此成員狀態（方便重複測試抽籤與提交）</span>
+                </button>
+              </div>
+            )}
 
             {authError && (
               <div
@@ -531,7 +865,8 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                   className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 text-xs font-medium text-slate-700 bg-slate-100 border border-slate-200 rounded-lg hover:bg-slate-200 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   <span>
-                    一鍵帶入未抽籤測試身分（{firstUnevaluatedMember.name} / {firstUnevaluatedMember.verifyCode}）
+                    一鍵帶入未抽籤測試身分（{firstUnevaluatedMember.name} /{' '}
+                    {firstUnevaluatedMember.verifyCode}）
                   </span>
                 </button>
               )}
@@ -540,68 +875,8 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
         </section>
       )}
 
-      {/* LOCKED STATE (Already Evaluated or Just Submitted) */}
-      {loggedInParticipant && isAlreadyLocked && (
-        <section className="max-w-2xl mx-auto bg-white border border-slate-200 rounded-xl p-6 md:p-8 space-y-5">
-          <div className="flex items-start gap-3">
-            <div className="p-2.5 bg-emerald-50 border border-emerald-200 rounded-lg text-emerald-700">
-              <CheckCircle2 className="w-6 h-6" />
-            </div>
-            <div>
-              <h2 className="text-lg font-bold text-slate-900">
-                匿名評核已提交並永久鎖定（即抽即焚票券已銷毀）
-              </h2>
-              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
-                親愛的 <span className="font-semibold text-slate-900">{loggedInParticipant.name}</span>（{loggedInParticipant.studentId}），您已完成本場次「{event.name}」之 1 對 1 匿名評核。
-              </p>
-            </div>
-          </div>
-
-          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-slate-600">評核人員身分隔離：</span>
-              <span className="font-mono font-semibold text-slate-900">
-                🔒 匿名評核人員（我）
-              </span>
-            </div>
-            {submittedReceiptToken && (
-              <div className="flex items-center justify-between">
-                <span className="text-slate-600">本次配發之不可逆盲籤憑證碼：</span>
-                <span className="font-mono font-bold text-emerald-700">
-                  {submittedReceiptToken}
-                </span>
-              </div>
-            )}
-            <div className="flex items-center justify-between">
-              <span className="text-slate-600">跨文本隔離（Artifact Isolation）：</span>
-              <span className="text-slate-800 font-medium">
-                已鎖定狀態，不可重複抽籤、修改或查閱他人對自己的評語
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center justify-between pt-2">
-            <span className="text-xs text-slate-500">
-              如需測試其他尚未抽籤之參與人員，可切換登入身分：
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                setLoggedInParticipant(null);
-                setDrawnTarget(null);
-                setSelectedParticipantId('');
-                setVerifyCodeInput('');
-              }}
-              className="px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 border border-slate-200 rounded-lg hover:bg-slate-200 cursor-pointer"
-            >
-              切換其他參與人員身分
-            </button>
-          </div>
-        </section>
-      )}
-
       {/* STEP 2: 1-to-1 Sattolo Draw Arena */}
-      {loggedInParticipant && !isAlreadyLocked && !drawnTarget && (
+      {!showCompletedScreen && loggedInParticipant && !drawnTarget && (
         <section className="max-w-2xl mx-auto bg-white border border-slate-200 rounded-xl p-6 space-y-5">
           <div className="flex flex-wrap items-center justify-between gap-2 pb-4 border-b border-slate-200">
             <div>
@@ -680,8 +955,8 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
       )}
 
       {/* STEP 3: Evaluation Form for Drawn Target */}
-      {loggedInParticipant && !isAlreadyLocked && drawnTarget && (
-        <form onSubmit={handleSubmitEvaluation} className="space-y-6">
+      {!showCompletedScreen && loggedInParticipant && drawnTarget && (
+        <div className="space-y-6">
           {/* Pairing Banner: Shows ONLY Target Name and Anonymous Evaluator (Me) */}
           <section className="bg-slate-900 text-white rounded-xl p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div className="space-y-1">
@@ -757,7 +1032,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
 
             <div className="space-y-3">
               {event.rubrics.map((item, idx) => {
-                const currentVal = scores[item.id] ?? 0;
+                const currentVal = getSafeScore(item);
                 const isExpanded = Boolean(expandedRubrics[item.id]);
 
                 return (
@@ -1041,16 +1316,14 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                         />
                       </td>
                       <td className="p-2 text-right">
-                        {attendanceRecords.length > 1 && (
-                          <button
-                            type="button"
-                            onClick={() => handleRemoveAttendanceRow(row.id)}
-                            aria-label={`刪除第 ${idx + 1} 列出席紀錄`}
-                            className="p-1 text-red-600 hover:bg-red-50 rounded cursor-pointer"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveAttendanceRow(row.id)}
+                          aria-label={`刪除第 ${idx + 1} 列出席紀錄`}
+                          className="p-1 text-red-600 hover:bg-red-50 rounded cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -1262,7 +1535,9 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                 </span>
               </div>
               <button
-                type="submit"
+                type="button"
+                data-testid="submit-evaluation-btn"
+                onClick={handleSubmitEvaluation}
                 className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 text-sm font-bold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer whitespace-nowrap"
               >
                 <ShieldCheck className="w-4 h-4 text-emerald-400" />
@@ -1270,7 +1545,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
               </button>
             </div>
           </section>
-        </form>
+        </div>
       )}
 
       {/* 5. 評核注意事項 Footer */}

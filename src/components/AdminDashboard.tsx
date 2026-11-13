@@ -34,6 +34,7 @@ import {
   LogOut,
   Edit3,
   FileText,
+  Layers,
 } from 'lucide-react';
 
 interface AdminDashboardProps {
@@ -42,7 +43,12 @@ interface AdminDashboardProps {
   onSelectEvent: (eventId: string) => void;
   onUpdateState: (updater: (prev: SystemState) => SystemState) => void;
   onNavigateToEvent: (eventName: string) => void;
-  onOpenPrintModal: (eventName: string, record: AnonymousEvaluationRecord, rubrics: RubricItem[]) => void;
+  onOpenPrintModal: (
+    eventName: string,
+    record: AnonymousEvaluationRecord,
+    rubrics: RubricItem[]
+  ) => void;
+  onShowToast: (msg: string, tone?: 'success' | 'error') => void;
   isAdminAuthenticated: boolean;
   adminPassword: string;
   onLoginSuccess: () => void;
@@ -59,6 +65,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   onUpdateState,
   onNavigateToEvent,
   onOpenPrintModal,
+  onShowToast,
   isAdminAuthenticated,
   adminPassword,
   onLoginSuccess,
@@ -74,15 +81,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const [newPasswordInput, setNewPasswordInput] = useState('');
   const [passwordSavedMsg, setPasswordSavedMsg] = useState('');
 
-  // Active sub-tab in Admin view
+  // Active sub-tab in Admin view ('all' renders all sections so nothing is hidden)
   const [activeSection, setActiveSection] = useState<
-    'overview' | 'roster' | 'rubrics' | 'notices'
-  >('overview');
+    'all' | 'overview' | 'roster' | 'rubrics' | 'notices'
+  >('all');
 
   // Copy feedback
   const [copiedUrl, setCopiedUrl] = useState(false);
 
-  // New event modal/inline
+  // New event inline form
   const [newEventName, setNewEventName] = useState('');
   const [newEventPeriod, setNewEventPeriod] = useState('115年10月01日 至 115年11月30日');
   const [showNewEventForm, setShowNewEventForm] = useState(false);
@@ -114,9 +121,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const exclusiveEventUrl = useMemo(() => {
     if (!currentEvent) return '';
     const origin =
-      typeof window !== 'undefined' ? window.location.origin + window.location.pathname : 'https://service-credits.edu.tw/';
+      typeof window !== 'undefined'
+        ? window.location.origin + window.location.pathname
+        : 'https://service-credits.edu.tw/';
     const compactPayload = {
-      v: 1,
+      v: 3,
       activeEventId: currentEvent.id,
       event: currentEvent,
       noticeItems: systemState.noticeItems,
@@ -211,18 +220,16 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   }
 
   const updateCurrentEvent = (updater: (ev: EventSession) => EventSession) => {
+    const targetEventId = currentEvent.id;
     onUpdateState((prev) => ({
       ...prev,
       updatedDate: getDateOnlyTimestamp(),
-      events: prev.events.map((ev) => (ev.id === currentEvent.id ? updater(ev) : ev)),
+      events: prev.events.map((ev) => (ev.id === targetEventId ? updater(ev) : ev)),
     }));
   };
 
-  const handleCreateEvent = (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmed = newEventName.trim();
-    if (!trimmed) return;
-    const newId = `evt-${Date.now().toString(36)}`;
+  const createBlankEventSession = (customName?: string, customPeriod?: string): EventSession => {
+    const newId = `evt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
     const defaultMembers: Participant[] = [
       {
         id: `${newId}-p1`,
@@ -243,13 +250,13 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         verifyCode: '5002',
       },
     ];
-    const newSession: EventSession = {
+    return {
       id: newId,
-      name: trimmed,
+      name: customName || '活動C-新建立場次',
       academicYear: '115學年度',
-      period: newEventPeriod.trim() || '115年10月01日 至 115年11月30日',
+      period: customPeriod || '115年10月01日 至 115年11月30日',
       participants: defaultMembers,
-      rubrics: DEFAULT_RUBRICS.map((r) => ({ ...r })),
+      rubrics: DEFAULT_RUBRICS.map((r, idx) => ({ ...r, id: `${newId}-rub-${idx + 1}` })),
       progressMap: {
         [`${newId}-p1`]: { participantId: `${newId}-p1`, hasDrawn: false, hasEvaluated: false },
         [`${newId}-p2`]: { participantId: `${newId}-p2`, hasDrawn: false, hasEvaluated: false },
@@ -258,30 +265,61 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       ticketPool: buildEncryptedTicketPool(newId, defaultMembers),
       evaluations: [],
     };
+  };
+
+  const handleCreateEvent = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = newEventName.trim() || `活動場次-${systemState.events.length + 1}`;
+    const newSession = createBlankEventSession(trimmed, newEventPeriod.trim());
     onUpdateState((prev) => ({
       ...prev,
       updatedDate: getDateOnlyTimestamp(),
       events: [...prev.events, newSession],
     }));
-    onSelectEvent(newId);
+    onSelectEvent(newSession.id);
     setNewEventName('');
     setShowNewEventForm(false);
+    onShowToast(`已建立新活動場次「${newSession.name}」`);
   };
 
+  /**
+   * 刪除此活動場次（不使用 window.confirm，避免沙盒阻擋）：
+   * 點擊後從 events 陣列移除該活動（若只剩最後 1 個活動則自動建立新空白活動），
+   * 並自動將當前選中活動切換為剩餘的第一個活動。
+   */
   const handleDeleteCurrentEvent = () => {
-    if (systemState.events.length <= 1) return;
-    const remaining = systemState.events.filter((e) => e.id !== currentEvent.id);
+    const deletedName = currentEvent.name;
+    const targetId = currentEvent.id;
+
+    if (systemState.events.length <= 1) {
+      const replacement = createBlankEventSession('活動A-新空白場次');
+      onUpdateState((prev) => ({
+        ...prev,
+        updatedDate: getDateOnlyTimestamp(),
+        events: [replacement],
+      }));
+      onSelectEvent(replacement.id);
+      onShowToast(`已刪除最後一個場次「${deletedName}」，並自動建立新空白場次`);
+      return;
+    }
+
+    const remaining = systemState.events.filter((e) => e.id !== targetId);
+    const nextSelectedId = remaining[0].id;
     onUpdateState((prev) => ({
       ...prev,
       updatedDate: getDateOnlyTimestamp(),
-      events: remaining,
+      events: prev.events.filter((e) => e.id !== targetId),
     }));
-    onSelectEvent(remaining[0].id);
+    onSelectEvent(nextSelectedId);
+    onShowToast(`已刪除活動場次「${deletedName}」，並切換至「${remaining[0].name}」`);
   };
 
   const handleRebuildSattoloPool = () => {
     updateCurrentEvent((ev) => {
-      const nextProgress: Record<string, { participantId: string; hasDrawn: boolean; hasEvaluated: boolean }> = {};
+      const nextProgress: Record<
+        string,
+        { participantId: string; hasDrawn: boolean; hasEvaluated: boolean }
+      > = {};
       for (const p of ev.participants) {
         nextProgress[p.id] = {
           participantId: p.id,
@@ -296,22 +334,28 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         ticketPool: buildEncryptedTicketPool(ev.id, ev.participants),
       };
     });
+    onShowToast('已重新產生 Sattolo 單環抽籤加密票券池');
   };
 
   const handleCopyExclusiveUrl = async () => {
     try {
       await navigator.clipboard.writeText(exclusiveEventUrl);
       setCopiedUrl(true);
+      onShowToast('已複製活動專屬評核網址');
       setTimeout(() => setCopiedUrl(false), 2000);
     } catch {
       setCopiedUrl(true);
+      onShowToast('已選取活動專屬評核網址');
       setTimeout(() => setCopiedUrl(false), 2000);
     }
   };
 
-  const handleAddSingleParticipant = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newStudentId.trim() || !newName.trim()) return;
+  const handleAddSingleParticipant = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!newStudentId.trim() || !newName.trim()) {
+      onShowToast('請輸入學號與姓名後再新增人員');
+      return;
+    }
     const pid = `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`;
     const code =
       newVerifyCode.trim() ||
@@ -332,7 +376,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         ...ev.progressMap,
         [pid]: { participantId: pid, hasDrawn: false, hasEvaluated: false },
       };
-      // Rebuild Sattolo pool for undrawn participants if needed
       return {
         ...ev,
         participants: nextParticipants,
@@ -345,9 +388,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     setNewStudentId('');
     setNewName('');
     setNewVerifyCode('');
+    onShowToast(`已新增參與人員：${added.name}（${added.studentId}）`);
   };
 
-  const handleRemoveParticipant = (pid: string) => {
+  const handleRemoveParticipant = (pid: string, pName: string) => {
     updateCurrentEvent((ev) => {
       const nextParticipants = ev.participants.filter((p) => p.id !== pid);
       const nextProgress = { ...ev.progressMap };
@@ -360,6 +404,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         ticketPool: buildEncryptedTicketPool(ev.id, nextParticipants),
       };
     });
+    onShowToast(`已移除參與人員：${pName}`);
   };
 
   const handleBatchImport = () => {
@@ -367,7 +412,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter(Boolean);
-    if (lines.length === 0) return;
+    if (lines.length === 0) {
+      setBatchMessage('請先貼上要匯入的名單資料或點擊「帶入整批匯入範例格式」。');
+      return;
+    }
 
     const imported: Participant[] = [];
     lines.forEach((line, idx) => {
@@ -415,7 +463,9 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     });
 
     setBatchText('');
-    setBatchMessage(`已成功匯入 ${imported.length} 名參與人員並重新產生 Sattolo 單環抽籤票券池。`);
+    const msg = `已成功匯入 ${imported.length} 名參與人員並重新產生 Sattolo 單環抽籤票券池。`;
+    setBatchMessage(msg);
+    onShowToast(msg);
   };
 
   const handleFillSampleBatch = () => {
@@ -423,6 +473,87 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
       `B11201006,周子瑜,資訊工程學系二年級,組負責人,3.0,1006\nB11201007,林彥廷,資訊工程學系一年級,一般組員,2.0,1007`
     );
     setBatchMessage('');
+  };
+
+  /**
+   * 新增評核項目：在當前活動的 rubrics 陣列 push 一筆新指標（預設配分 10 分，含完整三階段尺規欄位）
+   */
+  const handleAddRubricItem = () => {
+    const newRubric: RubricItem = {
+      id: `rub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`,
+      title: `新增評核指標 (${currentEvent.rubrics.length + 1})`,
+      maxScore: 10,
+      description: '請輸入此項服務表現評核指標之具體檢核說明。',
+      tierHigh: '高度表現：完整達成目標且表現優異（9–10分）',
+      tierMedium: '普通表現：大致完成指定項目（7–8分）',
+      tierLow: '待改進表現：未達標準或紀錄缺漏（0–6分）',
+    };
+    updateCurrentEvent((ev) => ({
+      ...ev,
+      rubrics: [...ev.rubrics, newRubric],
+    }));
+    onShowToast(`已新增評核項目「${newRubric.title}」（預設配分 10 分）`);
+  };
+
+  const handleUpdateRubricField = (
+    rubricId: string,
+    field: keyof RubricItem,
+    value: string | number
+  ) => {
+    updateCurrentEvent((ev) => ({
+      ...ev,
+      rubrics: ev.rubrics.map((r) =>
+        r.id === rubricId ? { ...r, [field]: value } : r
+      ),
+    }));
+  };
+
+  const handleDeleteRubricItem = (rubricId: string, title: string) => {
+    if (currentEvent.rubrics.length <= 1) {
+      onShowToast('至少需保留 1 項服務表現評核指標');
+      return;
+    }
+    updateCurrentEvent((ev) => ({
+      ...ev,
+      rubrics: ev.rubrics.filter((r) => r.id !== rubricId),
+    }));
+    onShowToast(`已刪除評核項目「${title}」`);
+  };
+
+  /**
+   * 評核注意事項 CRUD：動態新增、即時修改、刪除條文
+   */
+  const handleAddNoticeItem = () => {
+    onUpdateState((prev) => ({
+      ...prev,
+      updatedDate: getDateOnlyTimestamp(),
+      noticeItems: [
+        ...prev.noticeItems,
+        `新增評核注意事項條文（第 ${prev.noticeItems.length + 1} 點）：請輸入規範內容。`,
+      ],
+    }));
+    onShowToast('已新增一筆評核注意事項條文');
+  };
+
+  const handleUpdateNoticeItem = (index: number, newText: string) => {
+    onUpdateState((prev) => ({
+      ...prev,
+      updatedDate: getDateOnlyTimestamp(),
+      noticeItems: prev.noticeItems.map((item, idx) => (idx === index ? newText : item)),
+    }));
+  };
+
+  const handleDeleteNoticeItem = (index: number) => {
+    if (systemState.noticeItems.length <= 1) {
+      onShowToast('至少需保留 1 條評核注意事項');
+      return;
+    }
+    onUpdateState((prev) => ({
+      ...prev,
+      updatedDate: getDateOnlyTimestamp(),
+      noticeItems: prev.noticeItems.filter((_, idx) => idx !== index),
+    }));
+    onShowToast(`已刪除第 ${index + 1} 條評核注意事項`);
   };
 
   const handleOpenReviewEditor = (record: AnonymousEvaluationRecord) => {
@@ -451,6 +582,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     }));
     setEditingAnonToken(null);
     setReviewDraft(null);
+    onShowToast(`已儲存盲籤憑證 ${anonToken} 之校方審核結果`);
   };
 
   const handleExportCsv = () => {
@@ -529,6 +661,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    onShowToast('已匯出 UTF-8 CSV 零知識評核總表');
   };
 
   // Compute 3-column real-time progress lists (strictly decoupled from target pairing)
@@ -541,6 +674,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   const evaluatedParticipants = currentEvent.participants.filter(
     (p) => currentEvent.progressMap[p.id]?.hasEvaluated
   );
+
+  const showOverview = activeSection === 'all' || activeSection === 'overview';
+  const showRoster = activeSection === 'all' || activeSection === 'roster';
+  const showRubrics = activeSection === 'all' || activeSection === 'rubrics';
+  const showNotices = activeSection === 'all' || activeSection === 'notices';
 
   return (
     <div className="space-y-6">
@@ -712,6 +850,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           <div className="flex flex-wrap items-center gap-1.5 p-1 bg-slate-100 rounded-lg">
             <button
               type="button"
+              onClick={() => setActiveSection('all')}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                activeSection === 'all'
+                  ? 'bg-slate-900 text-white'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>全部管理區塊</span>
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveSection('overview')}
               className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 activeSection === 'overview'
@@ -762,7 +912,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </div>
       </section>
 
-      {activeSection === 'overview' && (
+      {showOverview && (
         <>
           {/* Event Settings & Exclusive URL + Offline SVG QR Code Distributor */}
           <section className="bg-white border border-slate-200 rounded-xl p-5">
@@ -777,16 +927,14 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       儲存設定後即自動將場次狀態以 UTF-8 安全 Base64 封裝於網址參數（<span className="font-mono">?s=...</span>），無須綁定碼即可直接分發。
                     </p>
                   </div>
-                  {systemState.events.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={handleDeleteCurrentEvent}
-                      className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 cursor-pointer whitespace-nowrap shrink-0"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                      <span>刪除此活動場次</span>
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={handleDeleteCurrentEvent}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-red-700 bg-red-50 border border-red-200 rounded-md hover:bg-red-100 cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>刪除此活動場次</span>
+                  </button>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -1437,11 +1585,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </>
       )}
 
-      {activeSection === 'roster' && (
+      {showRoster && (
         <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-6">
           <div>
             <h2 className="text-base font-bold text-slate-900">
-              參與人員名單管理（{currentEvent.name}）
+              04. 參與人員名單管理（{currentEvent.name}）
             </h2>
             <p className="text-xs text-slate-500 mt-0.5">
               支援單筆新增與整批貼上匯入（欄位：學號、姓名、系級、擔任職務、原訂最高點數、個人驗證碼／學號後4碼）。
@@ -1449,10 +1597,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
           </div>
 
           {/* Single Participant Add Form */}
-          <form
-            onSubmit={handleAddSingleParticipant}
-            className="p-4 bg-slate-50 border border-slate-200 rounded-lg grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-3 items-end"
-          >
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-7 gap-3 items-end">
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1">學號</label>
               <input
@@ -1460,7 +1605,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 value={newStudentId}
                 onChange={(e) => setNewStudentId(e.target.value)}
                 placeholder="B11201008"
-                required
                 className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md font-mono"
               />
             </div>
@@ -1471,7 +1615,6 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 placeholder="王大明"
-                required
                 className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
               />
             </div>
@@ -1526,14 +1669,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
             </div>
             <div>
               <button
-                type="submit"
+                type="button"
+                onClick={() => handleAddSingleParticipant()}
                 className="w-full inline-flex items-center justify-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>單筆新增</span>
               </button>
             </div>
-          </form>
+          </div>
 
           {/* Batch Paste Import */}
           <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg space-y-2.5">
@@ -1600,7 +1744,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     <td className="py-2.5 px-3 text-right">
                       <button
                         type="button"
-                        onClick={() => handleRemoveParticipant(p.id)}
+                        onClick={() => handleRemoveParticipant(p.id, p.name)}
                         aria-label={`刪除 ${p.name}`}
                         className="inline-flex items-center gap-1 px-2 py-1 text-xs text-red-700 hover:bg-red-50 rounded cursor-pointer"
                       >
@@ -1616,18 +1760,18 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
         </section>
       )}
 
-      {activeSection === 'rubrics' && (
+      {showRubrics && (
         <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-base font-bold text-slate-900">
-                服務表現評核標準與配分權重設定（{currentEvent.name}）
+                05. 服務表現評核標準與配分權重設定（{currentEvent.name}）
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
                 支援動態增刪評核項目、修改配分上限與三階段評分尺規文字，並即時檢核配分總和是否為 100 分。
               </p>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               <div
                 className={`px-3 py-1.5 rounded-md text-xs font-mono font-bold border ${
                   rubricTotalScore === 100
@@ -1640,24 +1784,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
               <button
                 type="button"
-                onClick={() =>
-                  updateCurrentEvent((ev) => ({
-                    ...ev,
-                    rubrics: [
-                      ...ev.rubrics,
-                      {
-                        id: `rub-${Date.now().toString(36)}`,
-                        title: '新增評核指標',
-                        maxScore: 10,
-                        description: '請輸入評核指標說明',
-                        tierHigh: '高度表現尺規說明',
-                        tierMedium: '普通表現尺規說明',
-                        tierLow: '待改進表現尺規說明',
-                      },
-                    ],
-                  }))
-                }
-                className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+                onClick={handleAddRubricItem}
+                className="inline-flex items-center gap-1 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 cursor-pointer whitespace-nowrap"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>新增評核項目</span>
@@ -1687,14 +1815,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </label>
                     <input
                       type="text"
+                      aria-label={`指標 ${idx + 1} 名稱`}
                       value={item.title}
                       onChange={(e) =>
-                        updateCurrentEvent((ev) => ({
-                          ...ev,
-                          rubrics: ev.rubrics.map((r) =>
-                            r.id === item.id ? { ...r, title: e.target.value } : r
-                          ),
-                        }))
+                        handleUpdateRubricField(item.id, 'title', e.target.value)
                       }
                       className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md font-semibold"
                     />
@@ -1707,54 +1831,42 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       type="number"
                       min="1"
                       max="100"
+                      aria-label={`指標 ${idx + 1} 配分上限`}
                       value={item.maxScore}
                       onChange={(e) =>
-                        updateCurrentEvent((ev) => ({
-                          ...ev,
-                          rubrics: ev.rubrics.map((r) =>
-                            r.id === item.id
-                              ? { ...r, maxScore: Math.max(0, parseInt(e.target.value, 10) || 0) }
-                              : r
-                          ),
-                        }))
+                        handleUpdateRubricField(
+                          item.id,
+                          'maxScore',
+                          Math.max(0, parseInt(e.target.value, 10) || 0)
+                        )
                       }
                       className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md font-mono font-bold"
                     />
                   </div>
-                  <div className="md:col-span-5">
+                  <div className="md:col-span-4">
                     <label className="block text-xs font-semibold text-slate-700 mb-1">
                       指標具體說明
                     </label>
                     <input
                       type="text"
+                      aria-label={`指標 ${idx + 1} 具體說明`}
                       value={item.description}
                       onChange={(e) =>
-                        updateCurrentEvent((ev) => ({
-                          ...ev,
-                          rubrics: ev.rubrics.map((r) =>
-                            r.id === item.id ? { ...r, description: e.target.value } : r
-                          ),
-                        }))
+                        handleUpdateRubricField(item.id, 'description', e.target.value)
                       }
                       className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
                     />
                   </div>
-                  <div className="md:col-span-1 flex justify-end pt-4">
-                    {currentEvent.rubrics.length > 1 && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          updateCurrentEvent((ev) => ({
-                            ...ev,
-                            rubrics: ev.rubrics.filter((r) => r.id !== item.id),
-                          }))
-                        }
-                        aria-label={`刪除指標 ${item.title}`}
-                        className="p-1.5 text-red-700 hover:bg-red-100 rounded cursor-pointer"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    )}
+                  <div className="md:col-span-2 flex justify-end pt-4">
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteRubricItem(item.id, item.title)}
+                      aria-label={`刪除指標 ${item.title}`}
+                      className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 rounded-md cursor-pointer whitespace-nowrap"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      <span>刪除項目</span>
+                    </button>
                   </div>
                 </div>
 
@@ -1765,14 +1877,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </label>
                     <input
                       type="text"
+                      aria-label={`指標 ${idx + 1} 高度表現尺規`}
                       value={item.tierHigh}
                       onChange={(e) =>
-                        updateCurrentEvent((ev) => ({
-                          ...ev,
-                          rubrics: ev.rubrics.map((r) =>
-                            r.id === item.id ? { ...r, tierHigh: e.target.value } : r
-                          ),
-                        }))
+                        handleUpdateRubricField(item.id, 'tierHigh', e.target.value)
                       }
                       className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
                     />
@@ -1783,14 +1891,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </label>
                     <input
                       type="text"
+                      aria-label={`指標 ${idx + 1} 普通表現尺規`}
                       value={item.tierMedium}
                       onChange={(e) =>
-                        updateCurrentEvent((ev) => ({
-                          ...ev,
-                          rubrics: ev.rubrics.map((r) =>
-                            r.id === item.id ? { ...r, tierMedium: e.target.value } : r
-                          ),
-                        }))
+                        handleUpdateRubricField(item.id, 'tierMedium', e.target.value)
                       }
                       className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
                     />
@@ -1801,14 +1905,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                     </label>
                     <input
                       type="text"
+                      aria-label={`指標 ${idx + 1} 待改進表現尺規`}
                       value={item.tierLow}
                       onChange={(e) =>
-                        updateCurrentEvent((ev) => ({
-                          ...ev,
-                          rubrics: ev.rubrics.map((r) =>
-                            r.id === item.id ? { ...r, tierLow: e.target.value } : r
-                          ),
-                        }))
+                        handleUpdateRubricField(item.id, 'tierLow', e.target.value)
                       }
                       className="w-full px-2.5 py-1.5 text-xs bg-white border border-slate-300 rounded-md"
                     />
@@ -1817,32 +1917,38 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
               </div>
             ))}
           </div>
+
+          <div className="pt-2 flex justify-end">
+            <button
+              type="button"
+              onClick={handleAddRubricItem}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 border border-slate-300 rounded-lg hover:bg-slate-200 cursor-pointer whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>＋ 新增評核項目（預設配分 10 分）</span>
+            </button>
+          </div>
         </section>
       )}
 
-      {activeSection === 'notices' && (
+      {showNotices && (
         <section className="bg-white border border-slate-200 rounded-xl p-5 space-y-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 className="text-base font-bold text-slate-900">
-                評核注意事項自訂編輯（同步顯示於頁尾與 A4 正式評核表）
+                06. 評核注意事項自訂編輯（共 {systemState.noticeItems.length} 條，同步顯示於頁尾與 A4 正式評核表）
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                預設列出《115學年度系學會服務學習點數評核表》5 點核心規範，可依學校最新公告新增或調整。
+                預設列出《115學年度系學會服務學習點數評核表》5 點核心規範，每一條皆可即時修改文字、刪除條文或新增條文。
               </p>
             </div>
             <button
               type="button"
-              onClick={() =>
-                onUpdateState((prev) => ({
-                  ...prev,
-                  noticeItems: [...prev.noticeItems, '請輸入新增之評核注意事項規範文字。'],
-                }))
-              }
-              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 cursor-pointer whitespace-nowrap"
+              onClick={handleAddNoticeItem}
+              className="inline-flex items-center gap-1 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 rounded-md hover:bg-slate-800 cursor-pointer whitespace-nowrap"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>新增注意事項</span>
+              <span>＋ 新增注意事項條文</span>
             </button>
           </div>
 
@@ -1856,33 +1962,31 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                   type="text"
                   value={note}
                   aria-label={`注意事項第 ${idx + 1} 點`}
-                  onChange={(e) =>
-                    onUpdateState((prev) => ({
-                      ...prev,
-                      noticeItems: prev.noticeItems.map((item, i) =>
-                        i === idx ? e.target.value : item
-                      ),
-                    }))
-                  }
-                  className="flex-1 px-3 py-2 text-xs bg-white border border-slate-300 rounded-md"
+                  onChange={(e) => handleUpdateNoticeItem(idx, e.target.value)}
+                  className="flex-1 px-3 py-2 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900"
                 />
-                {systemState.noticeItems.length > 1 && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onUpdateState((prev) => ({
-                        ...prev,
-                        noticeItems: prev.noticeItems.filter((_, i) => i !== idx),
-                      }))
-                    }
-                    aria-label={`刪除注意事項第 ${idx + 1} 點`}
-                    className="p-1.5 text-red-700 hover:bg-red-50 rounded cursor-pointer"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
+                <button
+                  type="button"
+                  onClick={() => handleDeleteNoticeItem(idx)}
+                  aria-label={`刪除注意事項第 ${idx + 1} 點`}
+                  className="inline-flex items-center gap-1 px-2.5 py-2 text-xs font-medium text-red-700 bg-red-50 border border-red-200 hover:bg-red-100 rounded-md cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>刪除條文</span>
+                </button>
               </div>
             ))}
+          </div>
+
+          <div className="pt-2">
+            <button
+              type="button"
+              onClick={handleAddNoticeItem}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 border border-slate-300 rounded-lg hover:bg-slate-200 cursor-pointer whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>＋ 新增注意事項條文</span>
+            </button>
           </div>
         </section>
       )}
