@@ -178,3 +178,29 @@ test('UTF-8 Base64 URL state encoder/decoder preserves Traditional Chinese chara
   const decoded = decodeStateFromBase64Url<typeof payload>(encoded);
   assert.deepEqual(decoded, payload);
 });
+
+test('parseHashRoute strips ?s= from eventName and extracts base64State whether ?s= is after # or before #', async () => {
+  const { parseHashRoute } = await import('../App');
+  const encodedSample = encodeStateToBase64Url({ v: 3, test: '活動A-迎新宿營' });
+
+  // Case 1: ?s= after # (#/%E6%B4%BB%E5%8B%95A-%E8%BF%8E%E6%96%B0%E5%AE%BF%E7%87%9F?s=...)
+  const afterHash = parseHashRoute(
+    `#/${encodeURIComponent('活動A-迎新宿營')}?s=${encodedSample}`,
+    '預設活動',
+    ''
+  );
+  assert.equal(afterHash.mode, 'event');
+  assert.equal(afterHash.eventName, '活動A-迎新宿營');
+  assert.equal(afterHash.base64State, encodedSample);
+
+  // Case 2: ?s= before # (?s=...#/活動A-迎新宿營)
+  const beforeHash = parseHashRoute(
+    '#/活動A-迎新宿營',
+    '預設活動',
+    `?s=${encodedSample}`
+  );
+  assert.equal(beforeHash.mode, 'event');
+  assert.equal(beforeHash.eventName, '活動A-迎新宿營');
+  assert.equal(beforeHash.base64State, encodedSample);
+});
+

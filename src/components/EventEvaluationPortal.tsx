@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from 'react';
+import React, { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import {
   AnonymousEvaluationRecord,
   AttendanceRecord,
@@ -44,6 +44,7 @@ interface EventEvaluationPortalProps {
   event: EventSession;
   noticeItems: string[];
   onUpdateState: (updater: (prev: SystemState) => SystemState) => void;
+  onLockUrlPayload?: () => void;
   onShowToast: (msg: string, tone?: 'success' | 'error') => void;
   onNavigateToAdmin: () => void;
 }
@@ -66,18 +67,99 @@ function buildDefaultScores(rubrics: RubricItem[]): Record<string, number> {
   return initial;
 }
 
+function getReceiptStorageKey(eventName: string): string {
+  return `service_credits_last_receipt_v3_${eventName.trim()}`;
+}
+
+function loadSavedReceipt(eventName: string): {
+  record: AnonymousEvaluationRecord;
+  evaluator: Participant;
+} | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = sessionStorage.getItem(getReceiptStorageKey(eventName));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.record && parsed.record.anonToken && parsed.evaluator) {
+      return parsed;
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return null;
+}
+
+function saveReceiptToSession(
+  eventName: string,
+  record: AnonymousEvaluationRecord,
+  evaluator: Participant
+): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.setItem(
+      getReceiptStorageKey(eventName),
+      JSON.stringify({ record, evaluator })
+    );
+  } catch {
+    // Ignore storage write errors
+  }
+}
+
+function clearReceiptFromSession(eventName: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    sessionStorage.removeItem(getReceiptStorageKey(eventName));
+  } catch {
+    // Ignore
+  }
+}
+
+/**
+ * 確保從 ?s= 解碼載入或外部連結點入的活動能 100% 匹配並更新至 events 陣列：
+ * 同時容許 e.id === activeEvent.id || e.name === activeEvent.name；
+ * 若在陣列中找不到對應活動，則直接將更新後的 activeEvent 推入 events 陣列。
+ */
+function upsertActiveEventInList(
+  eventsList: EventSession[],
+  activeEvent: EventSession,
+  transform: (targetEv: EventSession) => EventSession
+): EventSession[] {
+  const safeList = Array.isArray(eventsList) ? eventsList : [];
+  let matched = false;
+  const nextList = safeList.map((e) => {
+    if (e.id === activeEvent.id || e.name === activeEvent.name) {
+      matched = true;
+      return transform(e);
+    }
+    return e;
+  });
+  if (!matched) {
+    nextList.push(transform(activeEvent));
+  }
+  return nextList;
+}
+
 export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
   event,
   noticeItems,
   onUpdateState,
+  onLockUrlPayload,
   onShowToast,
   onNavigateToAdmin,
 }) => {
+  const initialReceipt = useMemo(() => loadSavedReceipt(event.name), [event.name]);
+
   // Step 1: Identity verification state
-  const [selectedParticipantId, setSelectedParticipantId] = useState<string>('');
-  const [verifyCodeInput, setVerifyCodeInput] = useState<string>('');
+  const [selectedParticipantId, setSelectedParticipantId] = useState<string>(
+    () => initialReceipt?.evaluator.id || ''
+  );
+  const [verifyCodeInput, setVerifyCodeInput] = useState<string>(
+    () => initialReceipt?.evaluator.verifyCode || ''
+  );
   const [authError, setAuthError] = useState<string>('');
-  const [loggedInParticipant, setLoggedInParticipant] = useState<Participant | null>(null);
+  const [loggedInParticipant, setLoggedInParticipant] = useState<Participant | null>(
+    () => initialReceipt?.evaluator || null
+  );
 
   // Step 2: 1-to-1 Sattolo Draw state
   const [drawnTarget, setDrawnTarget] = useState<Participant | null>(null);
@@ -134,10 +216,36 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     },
   ]);
 
-  // Highest-priority submission completion state
-  const [isSubmittedSuccess, setIsSubmittedSuccess] = useState<boolean>(false);
-  const [submittedReceiptRecord, setSubmittedReceiptRecord] =
-    useState<AnonymousEvaluationRecord | null>(null);
+  // Highest-priority submission completion state (bound directly to submit button)
+  const [isSubmittedSuccess, setIsSubmittedSuccess] = useState<boolean>(() =>
+    Boolean(initialReceipt)
+  );
+  const [lastSubmittedRecord, setLastSubmittedRecord] =
+    useState<AnonymousEvaluationRecord | null>(() => initialReceipt?.record || null);
+
+  // Only reset portal state when switching to a genuinely DIFFERENT event (neither id nor name matches)
+  const activeEventIdentityRef = useRef<{ id: string; name: string }>({
+    id: event.id,
+    name: event.name,
+  });
+
+  useEffect(() => {
+    const prev = activeEventIdentityRef.current;
+    if (event.id !== prev.id && event.name !== prev.name) {
+      activeEventIdentityRef.current = { id: event.id, name: event.name };
+      const savedForNewEvent = loadSavedReceipt(event.name);
+      setSelectedParticipantId(savedForNewEvent?.evaluator.id || '');
+      setVerifyCodeInput(savedForNewEvent?.evaluator.verifyCode || '');
+      setAuthError('');
+      setLoggedInParticipant(savedForNewEvent?.evaluator || null);
+      setDrawnTarget(null);
+      setScores(buildDefaultScores(event.rubrics));
+      setIsSubmittedSuccess(Boolean(savedForNewEvent));
+      setLastSubmittedRecord(savedForNewEvent?.record || null);
+    } else {
+      activeEventIdentityRef.current = { id: event.id, name: event.name };
+    }
+  }, [event.id, event.name, event.rubrics]);
 
   // Safe score getter that never returns undefined or NaN
   const getSafeScore = useCallback(
@@ -162,9 +270,10 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
 
   // Initialize default scores when target is drawn
   const initializeFormForTarget = (target: Participant) => {
+    clearReceiptFromSession(event.name);
     setScores(buildDefaultScores(event.rubrics));
     setIsSubmittedSuccess(false);
-    setSubmittedReceiptRecord(null);
+    setLastSubmittedRecord(null);
     setDrawnTarget(target);
   };
 
@@ -172,8 +281,10 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
    * 🔄 重置指定成員之抽籤與評核狀態（方便重複測試抽籤與提交）
    */
   const handleResetMemberStatus = (memberToReset: Participant) => {
+    onLockUrlPayload?.();
+    clearReceiptFromSession(event.name);
+
     const memberId = memberToReset.id;
-    // Choose a deterministic non-self target to seal into the ticket pool
     const otherCandidates = event.participants.filter((p) => p.id !== memberId);
     const preferredTarget =
       otherCandidates.find((p) => event.remainingPoolIds.includes(p.id)) ||
@@ -186,8 +297,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     onUpdateState((prev) => ({
       ...prev,
       updatedDate: getDateOnlyTimestamp(),
-      events: prev.events.map((ev) => {
-        if (ev.id !== event.id) return ev;
+      events: upsertActiveEventInList(prev.events, event, (ev) => {
         const nextRemaining = ev.remainingPoolIds.includes(preferredTarget.id)
           ? ev.remainingPoolIds
           : [...ev.remainingPoolIds, preferredTarget.id];
@@ -215,7 +325,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     setVerifyCodeInput(memberToReset.verifyCode);
     setDrawnTarget(null);
     setIsSubmittedSuccess(false);
-    setSubmittedReceiptRecord(null);
+    setLastSubmittedRecord(null);
     setAuthError('');
     onShowToast(
       `已重置「${memberToReset.name}」之狀態，現在可直接進行 1 對 1 抽籤與提交測試！`,
@@ -241,8 +351,11 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     setAuthError('');
     setLoggedInParticipant(member);
     setDrawnTarget(null);
-    setIsSubmittedSuccess(false);
-    setSubmittedReceiptRecord(null);
+    if (!event.progressMap[member.id]?.hasEvaluated) {
+      clearReceiptFromSession(event.name);
+      setIsSubmittedSuccess(false);
+      setLastSubmittedRecord(null);
+    }
     onShowToast(`已確認身分：${member.name}（${member.studentId}）`, 'success');
   };
 
@@ -255,6 +368,9 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
 
   // Step 2: Execute 1-to-1 Sattolo Draw & Remove Target from Pool
   const handleDrawTarget = () => {
+    // Lock URL payload so ?s= can never overwrite state after drawing
+    onLockUrlPayload?.();
+
     const evaluator =
       loggedInParticipant ||
       event.participants.find((p) => p.id === selectedParticipantId) ||
@@ -297,21 +413,18 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     onUpdateState((prev) => ({
       ...prev,
       updatedDate: getDateOnlyTimestamp(),
-      events: prev.events.map((ev) => {
-        if (ev.id !== event.id) return ev;
-        return {
-          ...ev,
-          remainingPoolIds: ev.remainingPoolIds.filter((id) => id !== targetObj.id),
-          progressMap: {
-            ...ev.progressMap,
-            [myId]: {
-              participantId: myId,
-              hasDrawn: true,
-              hasEvaluated: Boolean(ev.progressMap[myId]?.hasEvaluated),
-            },
+      events: upsertActiveEventInList(prev.events, event, (ev) => ({
+        ...ev,
+        remainingPoolIds: ev.remainingPoolIds.filter((id) => id !== targetObj.id),
+        progressMap: {
+          ...ev.progressMap,
+          [myId]: {
+            participantId: myId,
+            hasDrawn: true,
+            hasEvaluated: Boolean(ev.progressMap[myId]?.hasEvaluated),
           },
-        };
-      }),
+        },
+      })),
     }));
 
     setIsDrawingAnim(false);
@@ -390,15 +503,16 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
 
   /**
    * 步驟 3：提交匿名評核表並鎖定（自動執行 ECHO 淨化）
-   * 強制防呆重構：
-   * 1. 徹底移除所有「靜默 return」阻擋條件，若 drawnTarget 或 loggedInParticipant 缺失則自動以保底成員補齊。
-   * 2. 每個評核項目分數皆透過 getSafeScore 保底，絕不發生 undefined / NaN 崩潰。
-   * 3. 立即呼叫 setIsSubmittedSuccess(true) 強制切換至完成畫面並平滑滾動至頂部。
-   * 4. 同步寫入 evaluations 陣列並設定 hasEvaluated = true，顯示綠色成功 Toast。
+   * 強制綁定獨立完成畫面與 Upsert 寫入：
+   * 1. 鎖定 URL ?s= 快照（onLockUrlPayload），禁止舊快照覆寫。
+   * 2. 第一時間先計算分數、產生 #ANON-XXXXXX 盲籤憑證物件 newRecord。
+   * 3. 將 newRecord 存入 lastSubmittedRecord 本地 state（與 sessionStorage），並無條件設定 setIsSubmittedSuccess(true)。
+   * 4. 透過 upsertActiveEventInList 比對 e.id === event.id || e.name === event.name（若無則直接 push），100% 寫入成功。
    */
   const handleSubmitEvaluation = () => {
     try {
-      // 保底取得評核人與受評對象，絕不靜默 return
+      onLockUrlPayload?.();
+
       const effectiveEvaluator: Participant =
         loggedInParticipant ||
         event.participants.find((p) => p.id === selectedParticipantId) ||
@@ -475,7 +589,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
       );
       const finalAttStats = calculateAttendanceStats(sanitizedAttendances);
 
-      // 3. 建立不含 evaluatorId 的匿名評核物件
+      // 3. 建立不含 evaluatorId 的匿名評核物件 newRecord
       const newRecord: AnonymousEvaluationRecord = {
         anonToken: newAnonToken,
         targetId: effectiveTarget.id,
@@ -515,24 +629,23 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
         },
       };
 
-      // 4. 最高優先級：立即切換本地狀態至完成憑證畫面，並滾動至頂部
+      // 4. 第一時間存入 lastSubmittedRecord 本地 state 並無條件設定 setIsSubmittedSuccess(true)
       if (!loggedInParticipant) {
         setLoggedInParticipant(effectiveEvaluator);
       }
-      setSubmittedReceiptRecord(newRecord);
+      saveReceiptToSession(event.name, newRecord, effectiveEvaluator);
+      setLastSubmittedRecord(newRecord);
       setIsSubmittedSuccess(true);
 
       if (typeof window !== 'undefined' && typeof window.scrollTo === 'function') {
         window.scrollTo({ top: 0, behavior: 'smooth' });
       }
 
-      // 5. 同步寫入當前活動的 evaluations 陣列並將登入者標記為 hasEvaluated = true
+      // 5. 同步寫入 systemState.events（支援 id 或 name 雙重匹配，找不到則直接 push）
       onUpdateState((prev) => ({
         ...prev,
         updatedDate: getDateOnlyTimestamp(),
-        events: prev.events.map((ev) => {
-          if (ev.id !== event.id) return ev;
-
+        events: upsertActiveEventInList(prev.events, event, (ev) => {
           const nextTicketPool = { ...(ev.ticketPool || {}) };
           delete nextTicketPool[hashKey];
 
@@ -579,10 +692,10 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
     ? event.progressMap[loggedInParticipant.id]
     : undefined;
 
-  // Dual check with highest priority given to isSubmittedSuccess
+  // Outermost priority check: as soon as isSubmittedSuccess === true (or lastSubmittedRecord / hasEvaluated is true), render completion screen
   const showCompletedScreen =
     isSubmittedSuccess ||
-    Boolean(submittedReceiptRecord) ||
+    Boolean(lastSubmittedRecord) ||
     Boolean(myProgress?.hasEvaluated);
 
   return (
@@ -658,7 +771,7 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
               <h2 className="text-lg font-bold text-slate-900">
                 🎉 已完成匿名評核並鎖定（盲籤憑證碼{' '}
                 <span className="font-mono text-emerald-700">
-                  {submittedReceiptRecord?.anonToken || '#ANON-VERIFIED'}
+                  {lastSubmittedRecord?.anonToken || '#ANON-VERIFIED'}
                 </span>
                 ）
               </h2>
@@ -680,26 +793,26 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
                 🔒 匿名評核人員（我）
               </span>
             </div>
-            {submittedReceiptRecord && (
+            {lastSubmittedRecord && (
               <>
                 <div className="flex items-center justify-between">
                   <span className="text-slate-600">配發之不可逆盲籤憑證碼：</span>
                   <span className="font-mono font-bold text-emerald-700 text-sm">
-                    {submittedReceiptRecord.anonToken}
+                    {lastSubmittedRecord.anonToken}
                   </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-slate-600">受評對象與評核結果：</span>
                   <span className="font-mono font-bold text-slate-900">
-                    {submittedReceiptRecord.targetSnapshot.name} · 總分{' '}
-                    {submittedReceiptRecord.totalScore} 分（{submittedReceiptRecord.grade}{' '}
-                    等級 / 建議 {submittedReceiptRecord.suggestedPoints.toFixed(1)} 點）
+                    {lastSubmittedRecord.targetSnapshot.name} · 總分{' '}
+                    {lastSubmittedRecord.totalScore} 分（{lastSubmittedRecord.grade}{' '}
+                    等級 / 建議 {lastSubmittedRecord.suggestedPoints.toFixed(1)} 點）
                   </span>
                 </div>
                 <div className="pt-2 border-t border-slate-200">
                   <div className="text-slate-500 mb-1">ECHO 淨化後寫入後台之客觀評語：</div>
                   <div className="font-mono text-slate-800 bg-white p-2.5 rounded border border-slate-200">
-                    {submittedReceiptRecord.overallComment}
+                    {lastSubmittedRecord.overallComment}
                   </div>
                 </div>
               </>
@@ -728,10 +841,11 @@ export const EventEvaluationPortal: React.FC<EventEvaluationPortalProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  clearReceiptFromSession(event.name);
                   setLoggedInParticipant(null);
                   setDrawnTarget(null);
                   setIsSubmittedSuccess(false);
-                  setSubmittedReceiptRecord(null);
+                  setLastSubmittedRecord(null);
                   setSelectedParticipantId('');
                   setVerifyCodeInput('');
                 }}

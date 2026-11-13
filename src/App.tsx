@@ -6,7 +6,10 @@ import {
   SystemState,
 } from './types';
 import { createInitialSystemState, DEFAULT_RUBRICS, DEFAULT_NOTICE_ITEMS } from './utils/demoData';
-import { decodeStateFromBase64Url, encodeStateToBase64Url } from './utils/algorithms';
+import {
+  decodeStateFromBase64Url,
+  sortEvaluationsByAnonToken,
+} from './utils/algorithms';
 import { AdminDashboard } from './components/AdminDashboard';
 import { EventEvaluationPortal } from './components/EventEvaluationPortal';
 import { PrintSheetA4 } from './components/PrintSheetA4';
@@ -14,51 +17,87 @@ import { RefreshCw, Globe, RotateCcw, CheckCircle2, AlertCircle, X } from 'lucid
 
 export const STORAGE_KEY = 'service_credits_state_v3';
 const LEGACY_KEYS = ['service_credits_state_v1', 'service_credits_state_v2'];
+const CONSUMED_S_STORAGE_KEY = 'service_credits_consumed_s_v3';
 const ADMIN_AUTH_KEY = 'service_credits_admin_auth_v3';
 const ADMIN_PASS_KEY = 'service_credits_admin_pass_v3';
 const BROADCAST_CHANNEL_NAME = 'service_credits_sync_channel_v3';
 
 export type ToastTone = 'success' | 'error';
 
-interface RouteParsed {
+export interface RouteParsed {
   mode: 'admin' | 'event';
   eventName: string;
   base64State: string | null;
 }
 
-export function parseHashRoute(hashStr: string, defaultEventName: string): RouteParsed {
-  const raw = hashStr.startsWith('#') ? hashStr.slice(1) : hashStr;
-  if (!raw || raw === '/' || raw.startsWith('/管理編輯')) {
-    const qIdx = raw.indexOf('?s=');
-    return {
-      mode: 'admin',
-      eventName: defaultEventName,
-      base64State: qIdx >= 0 ? raw.slice(qIdx + 3) : null,
-    };
+function extractSParamFromQuery(queryPart: string): string | null {
+  if (!queryPart) return null;
+  const cleanQuery = queryPart.startsWith('?') ? queryPart.slice(1) : queryPart;
+  const match = cleanQuery.match(/(?:^|&)s=([^&#]*)/);
+  if (match && match[1]) {
+    try {
+      return decodeURIComponent(match[1]).trim();
+    } catch {
+      return match[1].trim();
+    }
+  }
+  const params = new URLSearchParams(cleanQuery);
+  return params.get('s');
+}
+
+/**
+ * 1. 修復 ?s= 參數在 Hash 路由前後的解析與更新衝突：
+ * - 支援 .../#/活動名稱?s=Base64（?s= 位於 # 之後）與 .../?s=Base64#/活動名稱（?s= 位於 # 之前）
+ * - 提取活動路由名稱時，必定先以 .split('?')[0] 剝離後面的 ?s=... 查詢字串再做 decodeURIComponent
+ */
+export function parseHashRoute(
+  hashStr: string,
+  defaultEventName: string,
+  searchStr: string = typeof window !== 'undefined' ? window.location.search : ''
+): RouteParsed {
+  let rawHash = hashStr.startsWith('#') ? hashStr.slice(1) : hashStr;
+
+  // 若整個 hash 被多層 percent-encode（含 %3F），先安全解碼一次
+  if (!rawHash.includes('?') && /%3[fF]/.test(rawHash)) {
+    try {
+      rawHash = decodeURIComponent(rawHash);
+    } catch {
+      // keep rawHash
+    }
   }
 
-  const [pathPart, queryPart] = raw.split('?');
-  let decodedPath = pathPart.replace(/^\/+/, '').trim();
+  // 先用 .split('?')[0] 去除後面的 ?s=... 查詢字串
+  const [rawPathPart, hashQueryPart = ''] = rawHash.split('?');
+  let decodedPath = rawPathPart.replace(/^\/+/, '').trim();
   try {
     decodedPath = decodeURIComponent(decodedPath).trim();
   } catch {
-    // keep raw pathPart if malformed URI
+    // keep rawPathPart if malformed URI
   }
+  // 再次確保 decodeURIComponent 後不會殘留任何 ?s=... 字串
+  decodedPath = decodedPath.split('?')[0].replace(/^\/+/, '').trim();
 
-  let sParam: string | null = null;
-  if (queryPart) {
-    const params = new URLSearchParams(queryPart);
-    sParam = params.get('s');
-  }
+  const sFromHash = extractSParamFromQuery(hashQueryPart);
+  const sFromSearch = extractSParamFromQuery(searchStr);
+  const base64State = sFromHash || sFromSearch || null;
 
-  if (!decodedPath || decodedPath === '管理編輯') {
-    return { mode: 'admin', eventName: defaultEventName, base64State: sParam };
+  if (
+    !decodedPath ||
+    decodedPath === '/' ||
+    decodedPath === '管理編輯' ||
+    decodedPath.startsWith('管理編輯')
+  ) {
+    return {
+      mode: 'admin',
+      eventName: defaultEventName,
+      base64State,
+    };
   }
 
   return {
     mode: 'event',
     eventName: decodedPath,
-    base64State: sParam,
+    base64State,
   };
 }
 
@@ -113,12 +152,155 @@ function normalizeEventSession(ev: EventSession): EventSession {
   };
 }
 
+/**
+ * 合併（Upsert）單一活動至既有活動物件，同時保留本地已提交之匿名評核紀錄與進度，防止舊 ?s= 快照覆蓋已提交結果
+ */
+function mergeEventPreservingLocalSubmissions(
+  existingEv: EventSession,
+  incomingEv: EventSession
+): EventSession {
+  const normalizedIncoming = normalizeEventSession(incomingEv);
+  const normalizedExisting = normalizeEventSession(existingEv);
+
+  // Union evaluations by anonToken so locally submitted evaluations are never lost
+  const evalMap = new Map<string, AnonymousEvaluationRecord>();
+  for (const rec of normalizedIncoming.evaluations) {
+    if (rec && rec.anonToken) evalMap.set(rec.anonToken, rec);
+  }
+  for (const rec of normalizedExisting.evaluations) {
+    if (rec && rec.anonToken) evalMap.set(rec.anonToken, rec);
+  }
+  const mergedEvaluations = sortEvaluationsByAnonToken(Array.from(evalMap.values()));
+
+  // Merge progressMap: preserve hasDrawn / hasEvaluated if already true locally
+  const mergedProgressMap: EventSession['progressMap'] = {};
+  for (const p of normalizedIncoming.participants) {
+    const incProg = normalizedIncoming.progressMap[p.id];
+    const exProg = normalizedExisting.progressMap[p.id];
+    mergedProgressMap[p.id] = {
+      participantId: p.id,
+      hasDrawn: Boolean(incProg?.hasDrawn || exProg?.hasDrawn),
+      hasEvaluated: Boolean(incProg?.hasEvaluated || exProg?.hasEvaluated),
+    };
+  }
+
+  const evaluatedTargetIds = new Set(mergedEvaluations.map((e) => e.targetId));
+  const mergedRemainingPool = normalizedIncoming.remainingPoolIds.filter(
+    (id) =>
+      !evaluatedTargetIds.has(id) &&
+      (normalizedExisting.remainingPoolIds.includes(id) ||
+        normalizedExisting.evaluations.length === 0)
+  );
+
+  return {
+    ...normalizedIncoming,
+    id: normalizedExisting.id || normalizedIncoming.id,
+    progressMap: mergedProgressMap,
+    remainingPoolIds: mergedRemainingPool,
+    evaluations: mergedEvaluations,
+  };
+}
+
+/**
+ * 3. 確保從 ?s= 解碼載入的活動能 100% 匹配並更新（Upsert）至 events 陣列：
+ * 支援單一活動封裝（decoded.event 或直接 EventSession）與完整狀態封裝（decoded.events）
+ */
+function upsertDecodedPayloadIntoState(
+  prevState: SystemState,
+  decoded: unknown
+): { nextState: SystemState; matchedEvent: EventSession | null } {
+  if (!decoded || typeof decoded !== 'object') {
+    return { nextState: prevState, matchedEvent: null };
+  }
+
+  const obj = decoded as {
+    v?: number;
+    activeEventId?: string;
+    event?: EventSession;
+    events?: EventSession[];
+    noticeItems?: string[];
+    id?: string;
+    name?: string;
+    participants?: unknown[];
+  };
+
+  let incomingEvents: EventSession[] = [];
+  if (obj.event && typeof obj.event === 'object') {
+    incomingEvents = [normalizeEventSession(obj.event)];
+  } else if (Array.isArray(obj.events) && obj.events.length > 0) {
+    incomingEvents = obj.events.map(normalizeEventSession);
+  } else if (obj.id && obj.name && Array.isArray(obj.participants)) {
+    incomingEvents = [normalizeEventSession(obj as unknown as EventSession)];
+  }
+
+  if (incomingEvents.length === 0) {
+    return { nextState: prevState, matchedEvent: null };
+  }
+
+  let nextEvents = [...prevState.events];
+  let primaryMatched: EventSession | null = null;
+
+  for (const inc of incomingEvents) {
+    const idx = nextEvents.findIndex(
+      (e) => e.id === inc.id || e.name === inc.name
+    );
+    if (idx >= 0) {
+      const merged = mergeEventPreservingLocalSubmissions(nextEvents[idx], inc);
+      nextEvents[idx] = merged;
+      if (!primaryMatched) primaryMatched = merged;
+    } else {
+      nextEvents.push(inc);
+      if (!primaryMatched) primaryMatched = inc;
+    }
+  }
+
+  const nextNoticeItems =
+    Array.isArray(obj.noticeItems) && obj.noticeItems.length > 0
+      ? obj.noticeItems
+      : prevState.noticeItems;
+
+  return {
+    nextState: {
+      ...prevState,
+      events: nextEvents,
+      noticeItems: nextNoticeItems,
+    },
+    matchedEvent: primaryMatched,
+  };
+}
+
+function hasAlreadyConsumedSParam(sParam: string): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    const raw = sessionStorage.getItem(CONSUMED_S_STORAGE_KEY);
+    if (!raw) return false;
+    const list = JSON.parse(raw) as string[];
+    return Array.isArray(list) && list.includes(sParam);
+  } catch {
+    return false;
+  }
+}
+
+function markSParamConsumedInSession(sParam: string): void {
+  if (typeof window === 'undefined' || !sParam) return;
+  try {
+    const raw = sessionStorage.getItem(CONSUMED_S_STORAGE_KEY);
+    const list: string[] = raw ? JSON.parse(raw) : [];
+    const safeList = Array.isArray(list) ? list : [];
+    if (!safeList.includes(sParam)) {
+      safeList.push(sParam);
+      sessionStorage.setItem(CONSUMED_S_STORAGE_KEY, JSON.stringify(safeList));
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
 function loadInitialState(): {
   state: SystemState;
   initialEventId: string;
   hydratedS: string | null;
 } {
-  // Clear legacy v1/v2 keys to prevent incompatible JSON structure interference
   if (typeof window !== 'undefined') {
     try {
       for (const oldKey of LEGACY_KEYS) {
@@ -131,10 +313,10 @@ function loadInitialState(): {
 
   const fallback = createInitialSystemState();
   let state: SystemState = fallback;
-  let initialEventId = fallback.events[0]?.id || 'evt-115-a';
+  let initialEventId = fallback.events[0]?.id || 'evt-a';
   let hydratedS: string | null = null;
 
-  // 1. Load from v3 localStorage
+  // 1. Load from v3 localStorage first
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) {
@@ -155,33 +337,33 @@ function loadInitialState(): {
     state = fallback;
   }
 
-  // 2. Only on initial mount: check if URL has a v3 ?s=... Base64 state
+  // 2. Check if URL has ?s=... parameter (either before # or after #)
   if (typeof window !== 'undefined') {
-    const parsedRoute = parseHashRoute(window.location.hash || '', initialEventId);
+    const parsedRoute = parseHashRoute(
+      window.location.hash || '',
+      state.events[0]?.name || '活動A-迎新宿營',
+      window.location.search || ''
+    );
+
     if (parsedRoute.base64State) {
       hydratedS = parsedRoute.base64State;
-      const decoded = decodeStateFromBase64Url<{
-        v?: number;
-        event?: EventSession;
-        noticeItems?: string[];
-      }>(parsedRoute.base64State);
-
-      // Only accept v === 3 payloads so stale v1/v2 URLs never overwrite v3 state
-      if (decoded && decoded.v === 3 && decoded.event && decoded.event.id) {
-        const incomingEvent = normalizeEventSession(decoded.event);
-        const exists = state.events.some((e) => e.id === incomingEvent.id);
-        const mergedEvents = exists
-          ? state.events.map((e) => (e.id === incomingEvent.id ? incomingEvent : e))
-          : [...state.events, incomingEvent];
-        state = {
-          ...state,
-          events: mergedEvents,
-          noticeItems:
-            Array.isArray(decoded.noticeItems) && decoded.noticeItems.length > 0
-              ? decoded.noticeItems
-              : state.noticeItems,
-        };
-        initialEventId = incomingEvent.id;
+      const alreadyConsumed = hasAlreadyConsumedSParam(parsedRoute.base64State);
+      const decoded = decodeStateFromBase64Url<unknown>(parsedRoute.base64State);
+      if (decoded) {
+        const { nextState, matchedEvent } = upsertDecodedPayloadIntoState(
+          state,
+          decoded
+        );
+        if (!alreadyConsumed) {
+          state = nextState;
+          markSParamConsumedInSession(parsedRoute.base64State);
+        } else {
+          // Even if already consumed, ensure the event exists in state.events while preserving all local submissions
+          state = nextState;
+        }
+        if (matchedEvent) {
+          initialEventId = matchedEvent.id;
+        }
       }
     }
 
@@ -207,8 +389,40 @@ function loadInitialState(): {
 export default function App() {
   const initialData = useMemo(() => loadInitialState(), []);
   const [systemState, setSystemState] = useState<SystemState>(initialData.state);
+  const systemStateRef = useRef<SystemState>(initialData.state);
   const [selectedEventId, setSelectedEventId] = useState<string>(initialData.initialEventId);
-  const lastHydratedSRef = useRef<string | null>(initialData.hydratedS);
+
+  // 2. 全域鎖定旗標：每個 ?s= 最多只允許在進入頁面時被解析匯入 1 次；一旦抽籤或提交，永遠鎖定以本地 State 與 localStorage 為唯一真實來源
+  const consumedUrlParamRef = useRef<string | null>(initialData.hydratedS);
+  const hasConsumedUrlPayloadRef = useRef<boolean>(Boolean(initialData.hydratedS));
+
+  useEffect(() => {
+    systemStateRef.current = systemState;
+  }, [systemState]);
+
+  // Keep URL clean on initial mount if ?s= was present so refreshing never re-triggers stale ?s=
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const currentHash = window.location.hash || '';
+    const currentSearch = window.location.search || '';
+    if (currentHash.includes('?s=') || currentSearch.includes('s=')) {
+      const parsed = parseHashRoute(
+        currentHash,
+        systemStateRef.current.events[0]?.name || '活動A-迎新宿營',
+        currentSearch
+      );
+      const cleanHash =
+        parsed.mode === 'admin'
+          ? '#/管理編輯'
+          : `#/${encodeURIComponent(parsed.eventName)}`;
+      try {
+        window.history.replaceState(null, '', `${window.location.pathname}${cleanHash}`);
+        setHashRoute(cleanHash);
+      } catch {
+        // Ignore history errors
+      }
+    }
+  }, []);
 
   // Toast notification state (supports 'success' green and 'error' red tones)
   const [toastState, setToastState] = useState<{
@@ -264,10 +478,12 @@ export default function App() {
         channel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
         channel.onmessage = (ev) => {
           if (ev.data && Array.isArray(ev.data.events)) {
-            setSystemState({
+            const normalized: SystemState = {
               ...ev.data,
               events: ev.data.events.map(normalizeEventSession),
-            });
+            };
+            systemStateRef.current = normalized;
+            setSystemState(normalized);
           }
         };
       }
@@ -280,10 +496,12 @@ export default function App() {
         try {
           const next = JSON.parse(e.newValue) as SystemState;
           if (next && Array.isArray(next.events)) {
-            setSystemState({
+            const normalized: SystemState = {
               ...next,
               events: next.events.map(normalizeEventSession),
-            });
+            };
+            systemStateRef.current = normalized;
+            setSystemState(normalized);
           }
         } catch {
           // Ignore malformed storage
@@ -299,73 +517,92 @@ export default function App() {
   }, []);
 
   /**
+   * 鎖定 URL 快照旗標並清除網址上的 ?s=... 查詢字串（絕不觸發 hashchange）
+   */
+  const lockUrlPayloadAndCleanAddress = useCallback(() => {
+    hasConsumedUrlPayloadRef.current = true;
+    if (typeof window !== 'undefined') {
+      try {
+        const parsed = parseHashRoute(
+          window.location.hash || '#/管理編輯',
+          systemStateRef.current.events[0]?.name || '活動A-迎新宿營',
+          window.location.search || ''
+        );
+        const cleanHash =
+          parsed.mode === 'admin'
+            ? '#/管理編輯'
+            : `#/${encodeURIComponent(parsed.eventName)}`;
+        window.history.replaceState(null, '', `${window.location.pathname}${cleanHash}`);
+      } catch {
+        // Ignore
+      }
+    }
+  }, []);
+
+  /**
    * 統一封裝之狀態更新函式 updateActivitiesState:
-   * 純粹更新 systemState，並同步寫入 localStorage、BroadcastChannel 與 history.replaceState。
+   * 同步更新 React State、寫入 localStorage、透過 BroadcastChannel 廣播，
+   * 並以 window.history.replaceState 移除網址上的 ?s=... 查詢字串（保持 Hash 主體不變且絕不觸發 hashchange 重載）
    */
   const updateActivitiesState = useCallback(
     (updater: (prev: SystemState) => SystemState) => {
-      setSystemState((prev) => {
-        const rawNext = updater(prev);
-        const next: SystemState = {
-          ...rawNext,
-          events: Array.isArray(rawNext.events)
-            ? rawNext.events.map(normalizeEventSession)
-            : prev.events,
-          noticeItems:
-            Array.isArray(rawNext.noticeItems) && rawNext.noticeItems.length > 0
-              ? rawNext.noticeItems
-              : prev.noticeItems,
-        };
+      hasConsumedUrlPayloadRef.current = true;
 
+      const prev = systemStateRef.current;
+      const rawNext = updater(prev);
+      const next: SystemState = {
+        ...rawNext,
+        events: Array.isArray(rawNext.events)
+          ? rawNext.events.map(normalizeEventSession)
+          : prev.events,
+        noticeItems:
+          Array.isArray(rawNext.noticeItems) && rawNext.noticeItems.length > 0
+            ? rawNext.noticeItems
+            : prev.noticeItems,
+      };
+
+      systemStateRef.current = next;
+      setSystemState(next);
+
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+        if (typeof BroadcastChannel !== 'undefined') {
+          const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+          bc.postMessage(next);
+          bc.close();
+        }
+      } catch {
+        // Ignore storage quota errors
+      }
+
+      if (typeof window !== 'undefined') {
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-          if (typeof BroadcastChannel !== 'undefined') {
-            const bc = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
-            bc.postMessage(next);
-            bc.close();
+          const currentHash = window.location.hash || '#/管理編輯';
+          const parsed = parseHashRoute(
+            currentHash,
+            next.events[0]?.name || '活動A-迎新宿營',
+            window.location.search || ''
+          );
+          if (parsed.mode === 'admin') {
+            const cleanAdminUrl = `${window.location.pathname}#/管理編輯`;
+            window.history.replaceState(null, '', cleanAdminUrl);
+          } else {
+            const targetEv =
+              next.events.find(
+                (e) => e.name === parsed.eventName || e.id === parsed.eventName
+              ) || next.events[0];
+            const cleanEventName = targetEv ? targetEv.name : parsed.eventName;
+            const cleanEventHash = `#/${encodeURIComponent(cleanEventName)}`;
+            window.history.replaceState(
+              null,
+              '',
+              `${window.location.pathname}${cleanEventHash}`
+            );
           }
         } catch {
-          // Ignore storage quota errors
+          // Ignore history replaceState errors
         }
-
-        // Silently synchronize URL via history.replaceState (without calling setState inside updater)
-        if (typeof window !== 'undefined') {
-          try {
-            const currentHash = window.location.hash || '#/管理編輯';
-            const parsed = parseHashRoute(
-              currentHash,
-              next.events[0]?.name || '活動A-迎新宿營'
-            );
-            if (parsed.mode === 'admin') {
-              const cleanAdminHash = '#/管理編輯';
-              if (window.location.hash !== cleanAdminHash) {
-                window.history.replaceState(null, '', cleanAdminHash);
-              }
-            } else {
-              const targetEv =
-                next.events.find(
-                  (e) => e.name === parsed.eventName || e.id === parsed.eventName
-                ) || next.events[0];
-              if (targetEv) {
-                const payload = {
-                  v: 3,
-                  activeEventId: targetEv.id,
-                  event: targetEv,
-                  noticeItems: next.noticeItems,
-                };
-                const encoded = encodeStateToBase64Url(payload);
-                lastHydratedSRef.current = encoded;
-                const nextEventHash = `#/${encodeURIComponent(targetEv.name)}?s=${encoded}`;
-                window.history.replaceState(null, '', nextEventHash);
-              }
-            }
-          } catch {
-            // Ignore history replaceState errors
-          }
-        }
-
-        return next;
-      });
+      }
     },
     []
   );
@@ -374,52 +611,76 @@ export default function App() {
   useEffect(() => {
     const handleHashChange = () => {
       const currentHash = window.location.hash || '#/管理編輯';
-      setHashRoute(currentHash);
+      const currentSearch = window.location.search || '';
+      const parsed = parseHashRoute(
+        currentHash,
+        systemStateRef.current.events[0]?.name || '活動A-迎新宿營',
+        currentSearch
+      );
 
-      const parsed = parseHashRoute(currentHash, '活動A-迎新宿營');
+      // Only consume a brand-new ?s= payload once on navigation into an event URL
+      if (
+        parsed.base64State &&
+        parsed.base64State !== consumedUrlParamRef.current
+      ) {
+        consumedUrlParamRef.current = parsed.base64State;
+        hasConsumedUrlPayloadRef.current = true;
+        markSParamConsumedInSession(parsed.base64State);
 
-      if (parsed.base64State && parsed.base64State !== lastHydratedSRef.current) {
-        lastHydratedSRef.current = parsed.base64State;
-        const decoded = decodeStateFromBase64Url<{
-          v?: number;
-          event?: EventSession;
-          noticeItems?: string[];
-        }>(parsed.base64State);
-
-        if (decoded && decoded.v === 3 && decoded.event && decoded.event.id) {
-          const incomingEvent = normalizeEventSession(decoded.event);
-          setSystemState((prev) => {
-            const exists = prev.events.some((e) => e.id === incomingEvent.id);
-            const nextEvents = exists
-              ? prev.events.map((e) => (e.id === incomingEvent.id ? incomingEvent : e))
-              : [...prev.events, incomingEvent];
-            const nextState: SystemState = {
-              ...prev,
-              events: nextEvents,
-              noticeItems:
-                Array.isArray(decoded.noticeItems) && decoded.noticeItems.length > 0
-                  ? decoded.noticeItems
-                  : prev.noticeItems,
-            };
-            try {
-              localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
-            } catch {
-              // Ignore
-            }
-            return nextState;
-          });
-          setSelectedEventId(incomingEvent.id);
-        }
-      } else if (parsed.mode === 'event') {
-        setSystemState((prev) => {
-          const matched = prev.events.find(
-            (e) => e.name === parsed.eventName || e.id === parsed.eventName
+        const decoded = decodeStateFromBase64Url<unknown>(parsed.base64State);
+        if (decoded) {
+          const { nextState, matchedEvent } = upsertDecodedPayloadIntoState(
+            systemStateRef.current,
+            decoded
           );
-          if (matched) {
-            setSelectedEventId(matched.id);
+          systemStateRef.current = nextState;
+          setSystemState(nextState);
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(nextState));
+          } catch {
+            // Ignore
           }
-          return prev;
-        });
+          if (matchedEvent) {
+            setSelectedEventId(matchedEvent.id);
+          }
+        }
+
+        // Immediately strip ?s=... from the address bar via replaceState so it never overwrites future submissions
+        const cleanHash =
+          parsed.mode === 'admin'
+            ? '#/管理編輯'
+            : `#/${encodeURIComponent(parsed.eventName)}`;
+        try {
+          window.history.replaceState(null, '', `${window.location.pathname}${cleanHash}`);
+        } catch {
+          // Ignore
+        }
+        setHashRoute(cleanHash);
+        return;
+      }
+
+      const cleanHash =
+        parsed.mode === 'admin'
+          ? '#/管理編輯'
+          : `#/${encodeURIComponent(parsed.eventName)}`;
+
+      if (currentHash.includes('?s=') || currentSearch.includes('s=')) {
+        try {
+          window.history.replaceState(null, '', `${window.location.pathname}${cleanHash}`);
+        } catch {
+          // Ignore
+        }
+      }
+
+      setHashRoute(cleanHash);
+
+      if (parsed.mode === 'event') {
+        const matched = systemStateRef.current.events.find(
+          (e) => e.name === parsed.eventName || e.id === parsed.eventName
+        );
+        if (matched) {
+          setSelectedEventId(matched.id);
+        }
       }
     };
 
@@ -468,7 +729,18 @@ export default function App() {
 
   const handleResetDemoData = () => {
     const fresh = createInitialSystemState();
-    lastHydratedSRef.current = null;
+    consumedUrlParamRef.current = null;
+    hasConsumedUrlPayloadRef.current = false;
+    if (typeof window !== 'undefined') {
+      try {
+        sessionStorage.removeItem(CONSUMED_S_STORAGE_KEY);
+        for (const ev of fresh.events) {
+          sessionStorage.removeItem(`service_credits_last_receipt_v3_${ev.name}`);
+        }
+      } catch {
+        // Ignore
+      }
+    }
     updateActivitiesState(() => fresh);
     setSelectedEventId(fresh.events[0].id);
     showToast('已重置為預設展示資料（活動A-迎新宿營、活動B-期末系大）', 'success');
@@ -702,10 +974,10 @@ export default function App() {
             />
           ) : (
             <EventEvaluationPortal
-              key={activeEventForPortal.id}
               event={activeEventForPortal}
               noticeItems={systemState.noticeItems}
               onUpdateState={updateActivitiesState}
+              onLockUrlPayload={lockUrlPayloadAndCleanAddress}
               onShowToast={showToast}
               onNavigateToAdmin={() => navigateToHash('#/管理編輯')}
             />
@@ -726,3 +998,4 @@ export default function App() {
     </div>
   );
 }
+

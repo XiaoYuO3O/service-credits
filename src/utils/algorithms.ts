@@ -403,7 +403,19 @@ export function encodeStateToBase64Url(data: unknown): string {
 export function decodeStateFromBase64Url<T>(encoded: string): T | null {
   try {
     if (!encoded) return null;
-    const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    let clean = encoded.trim();
+    if (clean.includes('%')) {
+      try {
+        clean = decodeURIComponent(clean);
+      } catch {
+        // Keep raw string if decodeURIComponent fails
+      }
+    }
+    // Convert URL-safe base64 (- and _) and any space (from '+' in query strings) back to standard base64
+    const base64 = clean
+      .replace(/\s/g, '+')
+      .replace(/-/g, '+')
+      .replace(/_/g, '/');
     const pad = base64.length % 4 === 0 ? '' : '='.repeat(4 - (base64.length % 4));
     const normalized = base64 + pad;
     let json = '';
@@ -422,3 +434,4 @@ export function decodeStateFromBase64Url<T>(encoded: string): T | null {
     return null;
   }
 }
+
